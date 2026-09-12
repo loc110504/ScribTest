@@ -22,6 +22,11 @@ from networks.unet_3d import UNet3D  # noqa: E402
 from train.legacy_splits import published_test_groups  # noqa: E402
 from utils.sliding_window_3d import sliding_window_predict  # noqa: E402
 
+# Python auto-adds this script's own directory (code/test/) to sys.path, so
+# the sibling module resolves as a bare import (avoids clashing with the
+# stdlib `test` package that `from test.metrics_3d import ...` would hit).
+from metrics_3d import aggregate_summary, summarize_case  # noqa: E402
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a UNet3D+pCE checkpoint")
@@ -37,21 +42,6 @@ def parse_args():
     parser.add_argument("--case_limit", type=int, default=None)
     parser.add_argument("--save_predictions", action="store_true")
     return parser.parse_args()
-
-
-def mean_finite(values):
-    values = [value for value in values if math.isfinite(value)]
-    return float(np.mean(values)) if values else math.nan
-
-
-def dice(prediction, target, class_id):
-    pred = prediction == class_id
-    truth = target == class_id
-    if not pred.any() and not truth.any():
-        return math.nan
-    if not pred.any() or not truth.any():
-        return 0.0
-    return float(2 * np.count_nonzero(pred & truth) / (pred.sum() + truth.sum()))
 
 
 def save_prediction(prediction_dhw, image_path, output_path):
@@ -134,17 +124,8 @@ def evaluate(args):
             temp_dir=args.temp_dir,
         )
         target = sample["label"]
-        per_class = {
-            str(class_id): dice(prediction, target, class_id)
-            for class_id in range(1, dataset.num_classes)
-        }
-        cases.append(
-            {
-                "case": sample["case"],
-                "mean_foreground_dice": mean_finite(per_class.values()),
-                "per_class_dice": per_class,
-            }
-        )
+        spacing = tuple(sample["spacing"].tolist())
+        cases.append(summarize_case(sample["case"], prediction, target, dataset.num_classes, spacing))
         if args.save_predictions:
             save_prediction(
                 prediction,
@@ -152,18 +133,7 @@ def evaluate(args):
                 output_dir / "predictions" / "{}.nii.gz".format(sample["case"]),
             )
 
-    summary = {
-        "scribblebench_mean_dice": mean_finite(
-            case["mean_foreground_dice"] for case in cases
-        ),
-        "per_class_dice": {
-            str(class_id): mean_finite(
-                case["per_class_dice"][str(class_id)] for case in cases
-            )
-            for class_id in range(1, dataset.num_classes)
-        },
-        "num_cases": len(cases),
-    }
+    summary = aggregate_summary(cases, dataset.num_classes)
     payload = {
         "checkpoint": str(checkpoint_path),
         "dataset": dataset_name,
@@ -183,7 +153,15 @@ def evaluate(args):
 
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(json_safe(payload), handle, indent=2, allow_nan=False)
-    print("ScribbleBench mean Dice: {:.6f}".format(summary["scribblebench_mean_dice"]))
+    print(
+        "ScribbleBench mean Dice: {:.6f} | HD95: {:.4f} mm | ASSD: {:.4f} mm".format(
+            summary["scribblebench_mean_dice"],
+            summary["scribblebench_mean_hd95"],
+            summary["scribblebench_mean_assd"],
+        )
+    )
+    if any(summary["per_class_missed_cases"].values()):
+        print("Missed cases (excluded from HD95/ASSD mean): {}".format(summary["per_class_missed_cases"]))
     print("Metrics: {}".format(output_dir / "metrics.json"))
     return summary
 
