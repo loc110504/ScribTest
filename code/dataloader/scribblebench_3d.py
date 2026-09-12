@@ -27,6 +27,9 @@ DATASET_CONFIGS = {
         "ignore_index": 4,
         "normalization": "zscore_nonzero",
     },
+    # Restricted to the 7 organs DMSPS (Han et al., 2024, Sec. 4.1) reports on
+    # for WORD -- liver, spleen, left/right kidney, stomach, gallbladder,
+    # pancreas -- rather than all 16 organs in the raw WORD label space.
     "WORD": {
         "class_names": (
             "background",
@@ -36,21 +39,45 @@ DATASET_CONFIGS = {
             "right_kidney",
             "stomach",
             "gallbladder",
-            "esophagus",
             "pancreas",
-            "duodenum",
-            "colon",
-            "intestine",
-            "adrenal",
-            "rectum",
-            "bladder",
-            "Head_of_femur_L",
-            "Head_of_femur_R",
         ),
-        "ignore_index": 17,
+        "ignore_index": 8,
         "normalization": "ct_window",
     },
 }
+
+# WORD-v0.1.0's original fixed label ids (1-16) for the 7 organs kept above.
+# Everything else on disk (esophagus=7, duodenum=9, colon=10, intestine=11,
+# adrenal=12, rectum=13, bladder=14, both femur heads=15/16) is outside this
+# benchmark's task and is collapsed away by `_remap_word_label` below.
+_WORD_ORIGINAL_TO_REDUCED = {
+    0: 0,  # background
+    1: 1,  # liver
+    2: 2,  # spleen
+    3: 3,  # left_kidney
+    4: 4,  # right_kidney
+    5: 5,  # stomach
+    6: 6,  # gallbladder
+    8: 7,  # pancreas (original id 8; id 7/esophagus is dropped)
+}
+
+
+def _remap_word_label(label, is_scribble, ignore_index):
+    """Collapse WORD's 16-organ label space to DMSPS's 7-organ subset.
+
+    Dense masks (``is_scribble=False``) are exhaustive, so any voxel outside
+    the 7 target organs is genuinely "not one of these organs" and becomes
+    background. Scribble points (``is_scribble=True``) are sparse, hand-drawn
+    annotations; remapping a real organ's scribble to background would
+    inject false supervision (the voxel is not background, it is simply an
+    organ this benchmark ignores), so those points are dropped to
+    ``ignore_index`` instead.
+    """
+    fallback = ignore_index if is_scribble else 0
+    remapped = np.full_like(label, fallback)
+    for original_id, new_id in _WORD_ORIGINAL_TO_REDUCED.items():
+        remapped[label == original_id] = new_id
+    return remapped
 
 
 def _strip_nii_suffix(path):
@@ -237,7 +264,10 @@ class ScribbleBench3DDataset(Dataset):
         image = _normalize_image(
             _as_dhw(image_xyz), self.normalization, ct_window=self.ct_window
         )
+        is_scribble = self.split == "train" and self.sup_type == "scribble"
         label = _as_dhw(label_xyz).astype(np.int64, copy=False)
+        if self.dataset_name == "WORD":
+            label = _remap_word_label(label, is_scribble, self.ignore_index)
         spacing = tuple(float(value) for value in image_nii.header.get_zooms()[:3][::-1])
         sample = {
             "image": image,
@@ -249,7 +279,7 @@ class ScribbleBench3DDataset(Dataset):
             "original_shape": np.asarray(image.shape, dtype=np.int64),
             "num_classes": self.num_classes,
             "ignore_index": self.ignore_index,
-            "is_scribble": self.split == "train" and self.sup_type == "scribble",
+            "is_scribble": is_scribble,
             "image_path": str(paths["image_path"]),
             "label_path": str(paths["label_path"]),
         }
@@ -263,7 +293,10 @@ class ScribbleBench3DDataset(Dataset):
                     raise ValueError(
                         "Image/dense-label shape mismatch for {}".format(paths["case"])
                     )
-                sample["gt_label"] = _as_dhw(dense_xyz).astype(np.int64, copy=False)
+                dense_label = _as_dhw(dense_xyz).astype(np.int64, copy=False)
+                if self.dataset_name == "WORD":
+                    dense_label = _remap_word_label(dense_label, is_scribble=False, ignore_index=self.ignore_index)
+                sample["gt_label"] = dense_label
 
         if self.transform is not None:
             sample = self.transform(sample)

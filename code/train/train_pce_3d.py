@@ -71,7 +71,7 @@ def parse_args():
     parser.add_argument("--max_accumulator_mb", type=int, default=1024)
     parser.add_argument("--temp_dir", default=None, help="directory for validation memmaps")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--foreground_crop_prob", type=float, default=1.0)
+    parser.add_argument("--foreground_crop_prob", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action="store_true")
@@ -162,7 +162,13 @@ def make_published_split(samples, dataset_name):
 
 
 def partial_cross_entropy(logits, target, ignore_index):
-    """Mean CE over annotated voxels only; unlabeled voxels have no gradient."""
+    """Mean CE over annotated voxels only; unlabeled voxels have no gradient.
+
+    With uniform random cropping (``foreground_crop_prob=0``, matching the
+    official CycleMix/DMSPS training recipes), a patch can legitimately
+    contain zero annotated voxels; it then contributes zero loss/gradient
+    rather than aborting the run.
+    """
     if logits.ndim != 5 or target.shape != logits.shape[:1] + logits.shape[2:]:
         raise ValueError(
             "Expected logits [B,C,D,H,W] and target [B,D,H,W], got {} and {}".format(
@@ -175,7 +181,7 @@ def partial_cross_entropy(logits, target, ignore_index):
         raise ValueError("scribble contains a class outside [0, num_classes-1]")
     valid_count = valid.sum()
     if valid_count.item() == 0:
-        raise ValueError("training patch has no annotated voxels")
+        return logits.sum() * 0.0, valid_count
     loss_sum = F.cross_entropy(logits, target, ignore_index=ignore_index, reduction="sum")
     return loss_sum / valid_count, valid_count
 
