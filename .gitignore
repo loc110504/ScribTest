@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Datasets & large binaries
+dataset/
+code/data/
+*.h5
+*.nii
+*.nii.gz
+*.zip
+*.pth
+*.pt
+
+# Training outputs
+results/
+checkpoints/
+*.log
+
+# Reference material (kept locally, not versioned)
+papers/
+
+# Project-specific (existing)
+LED_SDT_specs/
+AGENTS.md
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
