@@ -64,8 +64,18 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-2)
     parser.add_argument("--momentum", type=float, default=0.99)
     parser.add_argument("--weight_decay", type=float, default=3e-5)
-    parser.add_argument("--eval_every", type=int, default=1000)
-    parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument(
+        "--early_interval", type=int, default=5000,
+        help="eval+checkpoint cadence for iterations <= --late_phase_start",
+    )
+    parser.add_argument(
+        "--late_interval", type=int, default=1000,
+        help="eval+checkpoint cadence for iterations > --late_phase_start",
+    )
+    parser.add_argument(
+        "--late_phase_start", type=int, default=20000,
+        help="iteration at which the finer --late_interval cadence begins",
+    )
     parser.add_argument("--val_overlap", type=float, default=0.5)
     parser.add_argument("--sw_batch_size", type=int, default=1)
     parser.add_argument("--max_accumulator_mb", type=int, default=1024)
@@ -99,8 +109,10 @@ def validate_args(args):
     ]
     if np.prod(bottleneck_shape) <= 1:
         raise ValueError("patch_size produces a one-voxel bottleneck, which InstanceNorm cannot use")
-    if args.eval_every < 1 or args.save_every < 1 or args.num_workers < 0:
-        raise ValueError("eval_every/save_every must be positive and num_workers non-negative")
+    if args.early_interval < 1 or args.late_interval < 1 or args.num_workers < 0:
+        raise ValueError("early_interval/late_interval must be positive and num_workers non-negative")
+    if args.late_phase_start < 0:
+        raise ValueError("late_phase_start must be non-negative")
     if not 0 <= args.val_overlap < 1:
         raise ValueError("val_overlap must satisfy 0 <= val_overlap < 1")
     if not 0 <= args.foreground_crop_prob <= 1:
@@ -184,6 +196,17 @@ def partial_cross_entropy(logits, target, ignore_index):
         return logits.sum() * 0.0, valid_count
     loss_sum = F.cross_entropy(logits, target, ignore_index=ignore_index, reduction="sum")
     return loss_sum / valid_count, valid_count
+
+
+def checkpoint_due(step, late_phase_start, early_interval, late_interval):
+    """Coarse ``early_interval`` up to ``late_phase_start``, then finer ``late_interval``
+    after it -- e.g. every 5000 iterations for the first 20k of a 30k-iteration run, then
+    every 1000 for the remaining 10k (this repo's shared cadence across 3D training scripts).
+    """
+    if step <= 0:
+        return False
+    interval = early_interval if step <= late_phase_start else late_interval
+    return step % interval == 0
 
 
 def finite_mean(values):
@@ -440,8 +463,11 @@ def train(args):
                         lr,
                     )
 
-                should_evaluate = step % args.eval_every == 0 or step == args.max_iterations
-                if should_evaluate:
+                should_checkpoint = (
+                    checkpoint_due(step, args.late_phase_start, args.early_interval, args.late_interval)
+                    or step == args.max_iterations
+                )
+                if should_checkpoint:
                     result = validate(
                         model, val_dataset, val_indices, args, device, num_classes
                     )
@@ -474,8 +500,6 @@ def train(args):
                     else:
                         logging.info("Validation: iteration=%d mean_dice=%.6f", step, score)
                     model.train()
-
-                if step % args.save_every == 0 or step == args.max_iterations:
                     atomic_torch_save(
                         checkpoint_payload(
                             model, optimizer, scaler, args, split, step, best_score

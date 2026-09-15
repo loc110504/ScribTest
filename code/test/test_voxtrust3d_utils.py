@@ -1,0 +1,533 @@
+"""CPU regression checks for the VoxTrust-3D utilities."""
+
+import math
+import os
+import sys
+import unittest
+
+import numpy as np
+import torch
+
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
+
+from utils.voxtrust3d import (
+    RollingCalibrationBuffer,
+    assign_scribble_blocks,
+    batch_transfer_distance,
+    build_class_trees,
+    build_patch_coordinates,
+    build_pseudo_targets,
+    choose_patch_origin,
+    fit_distance_bins,
+    gather_patch,
+    masked_soft_ce_loss,
+    query_transfer_distance,
+    random_flip_rotate,
+    reliability_score,
+    scatter_points_into_patch,
+    spatially_blocked_partition,
+    stable_seed,
+    strong_intensity_augment_3d,
+    wilson_lower_bound,
+)
+
+
+class AssignScribbleBlocksTests(unittest.TestCase):
+    def test_two_slices_two_disjoint_blocks(self):
+        label = np.zeros((3, 6, 6), dtype=np.int64)
+        label[0, 0:2, 0:2] = 1
+        label[1, 4:6, 4:6] = 1
+        blocks = assign_scribble_blocks(label, num_classes=2)
+        self.assertEqual(len(blocks[1]), 2)
+        sizes = sorted(len(block) for block in blocks[1])
+        self.assertEqual(sizes, [4, 4])
+
+    def test_two_disjoint_components_same_slice_are_separate_blocks(self):
+        label = np.zeros((1, 10, 10), dtype=np.int64)
+        label[0, 0:2, 0:2] = 1
+        label[0, 8:10, 8:10] = 1
+        blocks = assign_scribble_blocks(label, num_classes=2)
+        self.assertEqual(len(blocks[1]), 2)
+
+    def test_background_class_is_included(self):
+        label = np.zeros((2, 4, 4), dtype=np.int64)
+        label[0, 0, 0] = 0
+        label[1, 3, 3] = 0
+        blocks = assign_scribble_blocks(label, num_classes=2)
+        self.assertIn(0, blocks)
+
+    def test_absent_class_has_no_blocks(self):
+        label = np.zeros((2, 4, 4), dtype=np.int64)
+        blocks = assign_scribble_blocks(label, num_classes=3)
+        self.assertEqual(blocks[2], [])
+
+
+class SpatiallyBlockedPartitionTests(unittest.TestCase):
+    def _label_with_n_blocks(self, n_blocks, class_id=1, ignore_index=2):
+        label = np.full((n_blocks, 4, 4), ignore_index, dtype=np.int64)
+        for d in range(n_blocks):
+            label[d, 0, 0] = class_id
+        return label
+
+    def test_sup_and_cal_are_disjoint_and_cover_all_scribble_voxels(self):
+        label = self._label_with_n_blocks(10)
+        rng = np.random.default_rng(0)
+        sup, cal, cal_block = spatially_blocked_partition(label, ignore_index=2, num_classes=2, holdout_fraction=0.3, rng=rng)
+        sup_set = {tuple(row) for row in sup[1]}
+        cal_set = {tuple(row) for row in cal[1]}
+        self.assertEqual(sup_set & cal_set, set())
+        expected = {tuple(row) for row in np.argwhere(label == 1)}
+        self.assertEqual(sup_set | cal_set, expected)
+        self.assertEqual(len(cal[1]), len(cal_block[1]))
+
+    def test_last_block_is_never_held_out(self):
+        label = self._label_with_n_blocks(1)
+        rng = np.random.default_rng(0)
+        sup, cal, _ = spatially_blocked_partition(label, ignore_index=2, num_classes=2, holdout_fraction=0.9, rng=rng)
+        self.assertEqual(len(sup[1]), 1)
+        self.assertEqual(len(cal[1]), 0)
+
+    def test_deterministic_given_same_seed(self):
+        label = self._label_with_n_blocks(20)
+        rng_a = np.random.default_rng(stable_seed(7, "caseA"))
+        rng_b = np.random.default_rng(stable_seed(7, "caseA"))
+        sup_a, cal_a, _ = spatially_blocked_partition(label, 2, 2, 0.3, rng_a)
+        sup_b, cal_b, _ = spatially_blocked_partition(label, 2, 2, 0.3, rng_b)
+        np.testing.assert_array_equal(sup_a[1], sup_b[1])
+        np.testing.assert_array_equal(cal_a[1], cal_b[1])
+
+    def test_holdout_fraction_out_of_range_raises(self):
+        label = self._label_with_n_blocks(3)
+        with self.assertRaises(ValueError):
+            spatially_blocked_partition(label, 2, 2, 0.0, np.random.default_rng(0))
+        with self.assertRaises(ValueError):
+            spatially_blocked_partition(label, 2, 2, 1.0, np.random.default_rng(0))
+
+
+class TransferDistanceTests(unittest.TestCase):
+    def test_matches_brute_force_with_anisotropic_spacing(self):
+        rng = np.random.default_rng(1)
+        sup_points = rng.integers(0, 20, size=(15, 3))
+        spacing = np.array([5.0, 1.0, 1.0])
+        trees = build_class_trees({0: sup_points}, spacing)
+
+        query_points = rng.integers(0, 20, size=(8, 3))
+        class_ids = np.zeros(8, dtype=np.int64)
+        distance = query_transfer_distance(trees, class_ids, query_points, spacing)
+
+        physical_sup = sup_points * spacing[None, :]
+        physical_query = query_points * spacing[None, :]
+        expected = np.array([np.min(np.linalg.norm(physical_sup - q, axis=1)) for q in physical_query])
+        np.testing.assert_allclose(distance, expected, atol=1e-6)
+
+    def test_missing_class_tree_gives_nan(self):
+        trees = build_class_trees({0: np.zeros((0, 3), dtype=np.int64)}, np.ones(3))
+        distance = query_transfer_distance(trees, np.array([0]), np.array([[1, 1, 1]]), np.ones(3))
+        self.assertTrue(np.isnan(distance[0]))
+
+    def test_batch_transfer_distance_only_touches_valid_voxels(self):
+        sup_points = {0: np.array([[0, 0, 0]])}
+        trees = [build_class_trees(sup_points, np.ones(3))]
+        predicted_class = np.zeros((1, 2, 2, 2), dtype=np.int64)
+        coord = np.stack(np.meshgrid(np.arange(2), np.arange(2), np.arange(2), indexing="ij"), axis=0)[None]
+        valid = np.zeros((1, 2, 2, 2), dtype=bool)
+        valid[0, 1, 1, 1] = True
+        out = batch_transfer_distance(predicted_class, coord, valid, trees, np.ones((1, 3)))
+        self.assertTrue(np.isnan(out[0, 0, 0, 0]))
+        self.assertAlmostEqual(out[0, 1, 1, 1], math.sqrt(3), places=5)
+
+
+class FitDistanceBinsTests(unittest.TestCase):
+    def test_edges_and_dmax_match_pooled_quantiles(self):
+        # class 1: Omega_sup at d=0; Omega_cal voxels at d=1,2,...,9 along one axis.
+        sup_coords = {1: np.array([[0, 0, 0]])}
+        cal_coords = {1: np.array([[0, 0, k] for k in range(1, 10)])}
+        case = {"sup_coords": sup_coords, "cal_coords": cal_coords, "spacing": np.ones(3)}
+        edges, d_max = fit_distance_bins([case], num_classes=2, num_strata=3)
+        self.assertAlmostEqual(d_max[1], 9.0)
+        self.assertEqual(edges.shape, (2, 2))
+        self.assertTrue(np.all(np.diff(edges[1]) >= 0))
+
+    def test_class_with_no_evidence_is_nan(self):
+        sup_coords = {1: np.array([[0, 0, 0]])}
+        cal_coords = {1: np.zeros((0, 3), dtype=np.int64)}
+        case = {"sup_coords": sup_coords, "cal_coords": cal_coords, "spacing": np.ones(3)}
+        edges, d_max = fit_distance_bins([case], num_classes=2, num_strata=3)
+        self.assertTrue(np.isnan(d_max[1]))
+        self.assertTrue(np.all(np.isnan(edges[1])))
+
+
+class ReliabilityScoreTests(unittest.TestCase):
+    def test_bounds_and_perfect_agreement_is_maximally_stable(self):
+        torch.manual_seed(0)
+        teacher_logits = torch.randn(2, 4, 3, 3, 3)
+        teacher_prob = torch.softmax(teacher_logits, dim=1)
+        result = reliability_score(teacher_prob, teacher_prob)
+        self.assertTrue(torch.all(result["stability"] >= 1.0 - 1e-5))
+        self.assertTrue(torch.all(result["score"] >= 0.0))
+        self.assertTrue(torch.all(result["score"] <= 1.0))
+
+    def test_confident_and_agreeing_prediction_scores_high(self):
+        teacher_prob = torch.zeros(1, 3, 1, 1, 1)
+        teacher_prob[0, 0] = 1.0
+        student_prob = teacher_prob.clone()
+        result = reliability_score(student_prob, teacher_prob)
+        self.assertGreater(result["score"].item(), 0.99)
+        self.assertEqual(result["teacher_pred"].item(), 0)
+
+    def test_shape_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            reliability_score(torch.rand(1, 3, 2, 2, 2), torch.rand(1, 2, 2, 2, 2))
+
+
+class WilsonLowerBoundTests(unittest.TestCase):
+    def test_matches_hand_computed_value(self):
+        # p_hat=0.9, n=100, delta=0.05 (z=1.959964) -> LCB ~= 0.826 (standard reference value).
+        lcb = wilson_lower_bound(0.9, 100, delta=0.05)
+        self.assertAlmostEqual(float(lcb), 0.826, places=3)
+
+    def test_more_samples_raises_the_bound_at_fixed_precision(self):
+        low_n = wilson_lower_bound(0.9, 20, delta=0.05)
+        high_n = wilson_lower_bound(0.9, 2000, delta=0.05)
+        self.assertGreater(high_n, low_n)
+
+    def test_zero_samples_gives_zero(self):
+        self.assertEqual(wilson_lower_bound(0.5, 0, delta=0.05), 0.0)
+
+
+class RollingCalibrationBufferTests(unittest.TestCase):
+    def test_fifo_eviction_at_buffer_size(self):
+        buffer = RollingCalibrationBuffer(num_classes=2, num_strata=2, buffer_size=3, block_cap=100)
+        for i in range(5):
+            buffer.update(
+                class_ids=np.array([1]), bin_ids=np.array([0]), block_ids=np.array([i]),
+                reliabilities=np.array([0.5]), corrects=np.array([1.0]),
+            )
+        self.assertEqual(len(buffer._bin_buffer(1, 0)), 3)
+        self.assertEqual(len(buffer._class_buffer(1)), 3)
+
+    def test_block_cap_limits_one_blocks_contribution(self):
+        buffer = RollingCalibrationBuffer(num_classes=2, num_strata=2, buffer_size=1000, block_cap=5,
+                                           rng=np.random.default_rng(0))
+        buffer.update(
+            class_ids=np.zeros(50, dtype=np.int64), bin_ids=np.zeros(50, dtype=np.int64),
+            block_ids=np.zeros(50, dtype=np.int64), reliabilities=np.linspace(0, 1, 50), corrects=np.ones(50),
+        )
+        self.assertEqual(len(buffer._bin_buffer(0, 0)), 5)
+
+    def test_negative_bin_id_updates_only_class_only_buffer(self):
+        buffer = RollingCalibrationBuffer(num_classes=2, num_strata=2, buffer_size=100, block_cap=100)
+        buffer.update(
+            class_ids=np.array([0]), bin_ids=np.array([-1]), block_ids=np.array([0]),
+            reliabilities=np.array([0.7]), corrects=np.array([1.0]),
+        )
+        self.assertEqual(len(buffer.per_bin), 0)
+        self.assertEqual(len(buffer._class_buffer(0)), 1)
+
+    def test_fit_thresholds_picks_minimal_feasible_grid_point(self):
+        buffer = RollingCalibrationBuffer(num_classes=1, num_strata=1, buffer_size=1000, block_cap=1000)
+        # 100 records: reliability 0.0..0.99, all correct above 0.5, mixed below.
+        reliabilities = np.linspace(0.0, 0.99, 100)
+        corrects = (reliabilities >= 0.5).astype(np.float64)
+        buffer.update(
+            class_ids=np.zeros(100, dtype=np.int64), bin_ids=np.zeros(100, dtype=np.int64),
+            block_ids=np.arange(100), reliabilities=reliabilities, corrects=corrects,
+        )
+        grid = np.linspace(0.0, 1.0, 101)
+        n_min, rho, delta = 10, 0.9, 0.05
+        thresholds, _ = buffer.fit_thresholds(grid, n_min, rho, delta)
+        picked = thresholds[0, 0]
+        self.assertTrue(math.isfinite(picked))
+
+        # Recompute feasibility directly from the raw records (Eq. 11-15) and
+        # check `picked` really is the *minimum* grid point that qualifies --
+        # this is a from-scratch cross-check, not a hardcoded magic number.
+        def feasible_at(t):
+            n_t = int(np.sum(reliabilities >= t))
+            k_t = int(np.sum((reliabilities >= t) & (corrects == 1)))
+            p_hat = k_t / max(n_t, 1)
+            return n_t >= n_min and wilson_lower_bound(p_hat, n_t, delta) >= rho
+
+        self.assertTrue(feasible_at(picked))
+        for t in grid[grid < picked - 1e-9]:
+            self.assertFalse(feasible_at(t), "grid point {} should not be feasible before {}".format(t, picked))
+
+    def test_abstains_below_min_samples(self):
+        buffer = RollingCalibrationBuffer(num_classes=1, num_strata=1, buffer_size=100, block_cap=100)
+        buffer.update(
+            class_ids=np.zeros(5, dtype=np.int64), bin_ids=np.zeros(5, dtype=np.int64),
+            block_ids=np.arange(5), reliabilities=np.ones(5), corrects=np.ones(5),
+        )
+        grid = np.linspace(0.0, 1.0, 101)
+        thresholds, _ = buffer.fit_thresholds(grid, n_min=32, rho=0.95, delta=0.05)
+        self.assertTrue(math.isinf(thresholds[0, 0]))
+
+    def test_state_dict_round_trip(self):
+        buffer = RollingCalibrationBuffer(num_classes=2, num_strata=2, buffer_size=10, block_cap=10)
+        buffer.update(
+            class_ids=np.array([0, 1]), bin_ids=np.array([0, 1]), block_ids=np.array([0, 1]),
+            reliabilities=np.array([0.6, 0.7]), corrects=np.array([1.0, 0.0]),
+        )
+        state = buffer.state_dict()
+        restored = RollingCalibrationBuffer(num_classes=2, num_strata=2, buffer_size=10, block_cap=10)
+        restored.load_state_dict(state)
+        self.assertEqual(list(restored._bin_buffer(0, 0)), list(buffer._bin_buffer(0, 0)))
+        self.assertEqual(list(restored._class_buffer(1)), list(buffer._class_buffer(1)))
+
+
+class BuildPseudoTargetsTests(unittest.TestCase):
+    def _base_tensors(self):
+        teacher_prob = torch.zeros(1, 2, 1, 1, 3)
+        teacher_prob[0, 0] = 1.0  # every voxel predicted class 0
+        teacher_pred = torch.zeros(1, 1, 1, 3, dtype=torch.long)
+        reliability = torch.full((1, 1, 1, 3), 0.9)
+        omega_u = torch.ones(1, 1, 1, 3, dtype=torch.bool)
+        stratum_edges = torch.zeros(2, 0)
+        return teacher_prob, teacher_pred, reliability, omega_u, stratum_edges
+
+    def test_in_support_accept_uses_stratum_threshold(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 1.0)
+        thresholds_table = torch.tensor([[0.5], [math.inf]])
+        class_only = torch.tensor([math.inf, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+        )
+        self.assertTrue(torch.all(out["mask"] > 0))
+
+    def test_out_of_support_rejects_even_with_high_reliability(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 5.0)  # > d_max
+        thresholds_table = torch.tensor([[0.0], [math.inf]])
+        class_only = torch.tensor([0.0, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+        )
+        self.assertTrue(torch.all(out["mask"] == 0))
+
+    def test_undefined_distance_falls_back_to_class_only(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), float("nan"))
+        thresholds_table = torch.tensor([[0.0], [math.inf]])
+        class_only = torch.tensor([0.5, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+        )
+        self.assertTrue(torch.all(out["mask"] > 0))
+        self.assertAlmostEqual(out["fallback_branch_ratio"].item(), 1.0)
+
+    def test_class_only_threshold_unavailable_rejects(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), float("nan"))
+        thresholds_table = torch.tensor([[0.0], [math.inf]])
+        class_only = torch.tensor([math.inf, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+        )
+        self.assertTrue(torch.all(out["mask"] == 0))
+
+    def test_omega_u_false_always_rejects(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        omega_u = torch.zeros_like(omega_u)
+        distance = torch.full((1, 1, 1, 3), 1.0)
+        thresholds_table = torch.tensor([[0.0], [math.inf]])
+        class_only = torch.tensor([0.0, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+        )
+        self.assertTrue(torch.all(out["mask"] == 0))
+
+
+class MaskedSoftCELossTests(unittest.TestCase):
+    def test_zero_when_mask_empty(self):
+        logits = torch.randn(1, 3, 2, 2, 2, requires_grad=True)
+        target = torch.softmax(torch.randn(1, 3, 2, 2, 2), dim=1)
+        mask = torch.zeros(1, 1, 2, 2, 2)
+        loss = masked_soft_ce_loss(logits, target, mask)
+        self.assertEqual(loss.item(), 0.0)
+
+    def test_matches_manual_computation_and_backprops_through_logits_only(self):
+        torch.manual_seed(0)
+        logits = torch.randn(1, 3, 1, 1, 2, requires_grad=True)
+        target = torch.softmax(torch.randn(1, 3, 1, 1, 2), dim=1)
+        mask = torch.ones(1, 1, 1, 1, 2)
+        loss = masked_soft_ce_loss(logits, target, mask)
+
+        log_prob = torch.log_softmax(logits, dim=1)
+        expected = -(target * log_prob).sum(dim=1, keepdim=True).mean()
+        self.assertAlmostEqual(loss.item(), expected.item(), places=5)
+
+        loss.backward()
+        self.assertIsNotNone(logits.grad)
+        self.assertTrue(torch.any(logits.grad != 0))
+
+
+class StrongIntensityAugment3DTests(unittest.TestCase):
+    class Args:
+        strong_brightness = 0.2
+        strong_brightness_prob = 1.0
+        strong_contrast = 0.2
+        strong_contrast_prob = 1.0
+        strong_gamma = 0.3
+        strong_gamma_prob = 1.0
+        strong_noise_std = 0.05
+        strong_noise_prob = 1.0
+        strong_blur_prob = 1.0
+        strong_blur_sigma_min = 0.5
+        strong_blur_sigma_max = 0.5
+
+    def test_preserves_shape_and_changes_the_image(self):
+        torch.manual_seed(0)
+        image = torch.rand(2, 1, 4, 8, 8)
+        augmented = strong_intensity_augment_3d(image, self.Args())
+        self.assertEqual(augmented.shape, image.shape)
+        self.assertFalse(torch.allclose(augmented, image))
+
+    def test_all_probabilities_zero_is_near_identity(self):
+        class NoAugArgs(self.Args):
+            strong_brightness_prob = 0.0
+            strong_contrast_prob = 0.0
+            strong_gamma_prob = 0.0
+            strong_noise_prob = 0.0
+            strong_blur_prob = 0.0
+
+        image = torch.rand(1, 1, 4, 8, 8)
+        augmented = strong_intensity_augment_3d(image, NoAugArgs())
+        torch.testing.assert_close(augmented, image)
+
+
+class ChoosePatchOriginTests(unittest.TestCase):
+    def test_no_padding_needed_origin_in_valid_range(self):
+        for _ in range(50):
+            origin = choose_patch_origin((10, 20, 20), (4, 4, 4))
+            for axis, size in enumerate((10, 20, 20)):
+                self.assertGreaterEqual(origin[axis], 0)
+                self.assertLessEqual(origin[axis] + 4, size)
+
+    def test_patch_larger_than_volume_forces_symmetric_negative_origin(self):
+        # shape[0]=10 < patch[0]=16: pad_before = (16-10)//2 = 3, so the
+        # single valid origin is exactly -3 (matches RandomCrop3D's symmetric padding).
+        origin = choose_patch_origin((10, 20, 20), (16, 4, 4))
+        self.assertEqual(origin[0], -3)
+
+    def test_foreground_bias_centers_on_a_foreground_voxel(self):
+        foreground_coords = np.array([[5, 5, 5]])
+        seen_offsets = set()
+        for _ in range(20):
+            origin = choose_patch_origin((10, 10, 10), (4, 4, 4), foreground_coords, foreground_prob=1.0)
+            for axis in range(3):
+                self.assertLessEqual(origin[axis], 5)
+                self.assertGreater(origin[axis] + 4, 5)
+            seen_offsets.add(tuple(origin))
+        self.assertGreater(len(seen_offsets), 1)  # still randomized within the feasible window
+
+
+class BuildPatchCoordinatesTests(unittest.TestCase):
+    def test_valid_flags_match_in_bounds_original_coordinates(self):
+        coord_d, coord_h, coord_w, valid = build_patch_coordinates((10, 10, 10), origin=[-3, 2, 2], patch_size=(6, 4, 4))
+        # First 3 D-slices are padding (origin -3, -2, -1 < 0); the rest are real.
+        self.assertTrue(np.all(~valid[:3]))
+        self.assertTrue(np.all(valid[3:]))
+        self.assertTrue(np.all(coord_d[:3] == -1))
+        np.testing.assert_array_equal(coord_d[3:, 0, 0], np.array([0, 1, 2]))
+        # Padding sentinel is consistent across every coordinate channel.
+        np.testing.assert_array_equal(coord_d < 0, coord_h < 0)
+        np.testing.assert_array_equal(coord_d < 0, coord_w < 0)
+
+
+class GatherPatchTests(unittest.TestCase):
+    def test_matches_direct_slice_when_fully_in_bounds(self):
+        array = np.arange(1000, dtype=np.float32).reshape(10, 10, 10)
+        origin = [2, 3, 4]
+        patch_size = (3, 3, 3)
+        _, _, _, valid = build_patch_coordinates(array.shape, origin, patch_size)
+        gathered = gather_patch(array, origin, patch_size, valid, fill_value=-1.0)
+        expected = array[2:5, 3:6, 4:7]
+        np.testing.assert_array_equal(gathered, expected)
+
+    def test_fills_out_of_range_voxels_without_touching_in_range_ones(self):
+        array = np.arange(1000, dtype=np.float64).reshape(10, 10, 10)
+        origin = [-2, 0, 0]
+        patch_size = (4, 2, 2)
+        _, _, _, valid = build_patch_coordinates(array.shape, origin, patch_size)
+        gathered = gather_patch(array, origin, patch_size, valid, fill_value=-99.0)
+        self.assertTrue(np.all(gathered[:2] == -99.0))
+        np.testing.assert_array_equal(gathered[2:], array[0:2, 0:2, 0:2])
+
+
+class ScatterPointsIntoPatchTests(unittest.TestCase):
+    def test_only_points_inside_the_window_are_written(self):
+        out = np.zeros((4, 4, 4), dtype=np.int64)
+        coords = np.array([[5, 5, 5], [6, 1, 1], [20, 20, 20]])  # origin=[5,0,0]; only the 2nd point lands inside
+        values = np.array([11, 22, 33])
+        scatter_points_into_patch(coords, values, origin=[5, 0, 0], patch_size=(4, 4, 4), out=out)
+        self.assertEqual(out[1, 1, 1], 22)
+        self.assertEqual(int(out.sum()), 22)
+
+    def test_empty_coords_is_a_no_op(self):
+        out = np.zeros((2, 2, 2), dtype=np.int64)
+        scatter_points_into_patch(np.zeros((0, 3), dtype=np.int64), np.zeros(0), [0, 0, 0], (2, 2, 2), out)
+        self.assertEqual(out.sum(), 0)
+
+
+class RandomFlipRotateTests(unittest.TestCase):
+    def test_arrays_stay_pixel_aligned(self):
+        rng = np.random.default_rng(0)
+        image = rng.random((4, 6, 6)).astype(np.float32)
+        marker = np.zeros((4, 6, 6), dtype=np.int64)
+        marker[2, 3, 1] = 1  # a single distinguishable voxel
+        out = random_flip_rotate({"image": image, "marker": marker})
+        marked = np.argwhere(out["marker"] == 1)
+        self.assertEqual(len(marked), 1)
+        d, h, w = marked[0]
+        self.assertEqual(out["image"][d, h, w], image[2, 3, 1])
+
+
+class PatchPipelineEndToEndTests(unittest.TestCase):
+    """choose_patch_origin -> build_patch_coordinates -> gather_patch -> random_flip_rotate,
+    exactly as VoxTrustPatch3DDataset.__getitem__ composes them."""
+
+    def test_coordinate_channel_reproduces_source_intensity_after_full_pipeline(self):
+        depth, height, width = 6, 6, 6
+        image = np.random.default_rng(1).random((depth, height, width)).astype(np.float32)
+        origin = choose_patch_origin((depth, height, width), (4, 4, 4))
+        coord_d, coord_h, coord_w, valid = build_patch_coordinates((depth, height, width), origin, (4, 4, 4))
+        image_patch = gather_patch(image, origin, (4, 4, 4), valid, 0.0)
+        augmented = random_flip_rotate(
+            {"image": image_patch, "coord_d": coord_d, "coord_h": coord_h, "coord_w": coord_w}
+        )
+        for d in range(4):
+            for h in range(4):
+                for w in range(4):
+                    od, oh, ow = augmented["coord_d"][d, h, w], augmented["coord_h"][d, h, w], augmented["coord_w"][d, h, w]
+                    self.assertGreaterEqual(od, 0)  # (depth,height,width)=(6,6,6) >= patch, so never padded here
+                    self.assertEqual(augmented["image"][d, h, w], image[od, oh, ow])
+
+    def test_padding_case_never_allocates_full_volume_sized_arrays(self):
+        # WORD-scale regression guard: patch larger than one axis must still
+        # only ever produce patch_size-shaped intermediates.
+        shape = (10, 20, 20)
+        patch_size = (16, 8, 8)
+        origin = choose_patch_origin(shape, patch_size)
+        coord_d, coord_h, coord_w, valid = build_patch_coordinates(shape, origin, patch_size)
+        for array in (coord_d, coord_h, coord_w, valid):
+            self.assertEqual(array.shape, patch_size)
+        image = np.zeros(shape, dtype=np.float32)
+        gathered = gather_patch(image, origin, patch_size, valid, 0.0)
+        self.assertEqual(gathered.shape, patch_size)
+
+
+if __name__ == "__main__":
+    unittest.main()

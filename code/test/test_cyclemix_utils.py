@@ -157,8 +157,9 @@ class CycleMixStepTests(unittest.TestCase):
             patch_size = None
             feature_channels = [16, 32, 64, 128, 256]
             max_iterations = 100
-            eval_every = 10
-            save_every = 10
+            early_interval = 10
+            late_interval = 10
+            late_phase_start = 50
             num_workers = 0
             val_overlap = 0.5
             foreground_crop_prob = 1.0

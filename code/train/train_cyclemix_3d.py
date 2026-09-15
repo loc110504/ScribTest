@@ -39,6 +39,7 @@ from dataloader.scribblebench_3d import (  # noqa: E402
 from networks.unet_3d import UNet3D  # noqa: E402
 from train.common_3d import (  # noqa: E402
     atomic_torch_save,
+    checkpoint_due,
     make_published_split,
     partial_cross_entropy,
     seed_everything,
@@ -78,8 +79,18 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-2)
     parser.add_argument("--momentum", type=float, default=0.99)
     parser.add_argument("--weight_decay", type=float, default=3e-5)
-    parser.add_argument("--eval_every", type=int, default=1000)
-    parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument(
+        "--early_interval", type=int, default=5000,
+        help="eval+checkpoint cadence for iterations <= --late_phase_start",
+    )
+    parser.add_argument(
+        "--late_interval", type=int, default=1000,
+        help="eval+checkpoint cadence for iterations > --late_phase_start",
+    )
+    parser.add_argument(
+        "--late_phase_start", type=int, default=20000,
+        help="iteration at which the finer --late_interval cadence begins",
+    )
     parser.add_argument("--val_overlap", type=float, default=0.5)
     parser.add_argument("--sw_batch_size", type=int, default=1)
     parser.add_argument("--max_accumulator_mb", type=int, default=1024)
@@ -125,8 +136,10 @@ def validate_args(args):
     bottleneck_shape = [size // divisor for size, divisor in zip(args.patch_size, divisors)]
     if np.prod(bottleneck_shape) <= 1:
         raise ValueError("patch_size produces a one-voxel bottleneck, which InstanceNorm cannot use")
-    if args.eval_every < 1 or args.save_every < 1 or args.num_workers < 0:
-        raise ValueError("eval_every/save_every must be positive and num_workers non-negative")
+    if args.early_interval < 1 or args.late_interval < 1 or args.num_workers < 0:
+        raise ValueError("early_interval/late_interval must be positive and num_workers non-negative")
+    if args.late_phase_start < 0:
+        raise ValueError("late_phase_start must be non-negative")
     if not 0 <= args.val_overlap < 1:
         raise ValueError("val_overlap must satisfy 0 <= val_overlap < 1")
     if not 0 <= args.foreground_crop_prob <= 1:
@@ -373,8 +386,11 @@ def train(args):
                         components["con_global"], components["con_local"], lr,
                     )
 
-                should_evaluate = step % args.eval_every == 0 or step == args.max_iterations
-                if should_evaluate:
+                should_checkpoint = (
+                    checkpoint_due(step, args.late_phase_start, args.early_interval, args.late_interval)
+                    or step == args.max_iterations
+                )
+                if should_checkpoint:
                     result = validate(model, val_dataset, val_indices, args, device, num_classes)
                     last_eval_step = step
                     score = result["mean_dice"]
@@ -403,8 +419,6 @@ def train(args):
                     else:
                         logging.info("Validation: iteration=%d mean_dice=%.6f", step, score)
                     model.train()
-
-                if step % args.save_every == 0 or step == args.max_iterations:
                     atomic_torch_save(
                         checkpoint_payload(model, optimizer, scaler, args, split, step, best_score),
                         output_dir / "last.pth",

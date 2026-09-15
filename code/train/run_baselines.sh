@@ -9,8 +9,11 @@
 #   3. train_sdtnet_3d.py             -> test_pce_3d.py       (SDT-Net's
 #                                         deployed student is also a plain
 #                                         UNet3D checkpoint)
-#   4. train_dmsps_3d.py --stage 1     -> test_dmsps_3d.py     (stage-1 DB-Net)
-#   5. train_dmsps_3d.py --stage 2     -> test_dmsps_3d.py     (re-initialized
+#   4. train_voxtrust3d_3d.py         -> test_pce_3d.py       (VoxTrust-3D's
+#                                         deployed EMA teacher is also a
+#                                         plain UNet3D checkpoint)
+#   5. train_dmsps_3d.py --stage 1     -> test_dmsps_3d.py     (stage-1 DB-Net)
+#   6. train_dmsps_3d.py --stage 2     -> test_dmsps_3d.py     (re-initialized
 #      (--init_checkpoint = stage-1 best.pth)                   from stage 1)
 #
 # All scripts default to `--foreground_crop_prob 0` (uniform random crop),
@@ -38,7 +41,7 @@
 #
 # Example - quick end-to-end smoke run on CPU, ACDC only:
 #   SCRIBBLE_DATASETS=ACDC SCRIBBLE_DEVICE=cpu SCRIBBLE_AMP_FLAG="" SCRIBBLE_BATCH_SIZE=2 \
-#   SCRIBBLE_EXTRA_TRAIN_ARGS="--max_iterations 4 --eval_every 2 --save_every 2 --num_workers 0" \
+#   SCRIBBLE_EXTRA_TRAIN_ARGS="--max_iterations 4 --early_interval 2 --late_interval 2 --num_workers 0" \
 #   SCRIBBLE_EXTRA_TEST_ARGS="--case_limit 2" \
 #   bash code/train/run_baselines.sh
 
@@ -85,6 +88,10 @@ train_and_test() {
       python "$script_dir/train_sdtnet_3d.py" --dataset "$dataset" \
         --output_dir "$ckpt_dir" --batch_size "$batch_size" $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
       ;;
+    VoxTrust3D)
+      python "$script_dir/train_voxtrust3d_3d.py" --dataset "$dataset" \
+        --output_dir "$ckpt_dir" --batch_size "$batch_size" $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
+      ;;
     DMSPS)
       python "$script_dir/train_dmsps_3d.py" --dataset "$dataset" \
         --output_dir "$ckpt_dir" --batch_size "$batch_size" $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
@@ -97,7 +104,7 @@ train_and_test() {
 
   echo "=== [$method_label] dataset=$dataset stage=${stage:-none}: test ==="
   case "$method_label" in
-    pCE|CycleMix|SDTNet)
+    pCE|CycleMix|SDTNet|VoxTrust3D)
       python "$test_dir/test_pce_3d.py" \
         --checkpoint "$ckpt_dir/best.pth" --output_dir "$results_dir" $amp_flag $device_flag $root_path_flag $extra_test_args
       ;;
@@ -122,6 +129,10 @@ for dataset in "${datasets[@]}"; do
   train_and_test SDTNet "$dataset" "" \
     "$checkpoint_root/ScribbleBench_SDTNet/$dataset" \
     "$results_root/ScribbleBench_SDTNet/$dataset"
+
+  train_and_test VoxTrust3D "$dataset" "" \
+    "$checkpoint_root/ScribbleBench_VoxTrust3D/$dataset" \
+    "$results_root/ScribbleBench_VoxTrust3D/$dataset"
 
   dmsps_stage1_ckpt_dir="$checkpoint_root/ScribbleBench_DMSPS/$dataset/stage1"
   train_and_test DMSPS "$dataset" stage1 \

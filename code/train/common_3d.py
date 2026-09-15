@@ -97,6 +97,22 @@ def make_published_split(samples, dataset_name):
     return train_indices, val_indices, train_groups, val_groups, protocol
 
 
+def checkpoint_due(step, late_phase_start, early_interval, late_interval):
+    """Shared eval+checkpoint cadence for every scribble-supervised 3D script.
+
+    Coarse ``early_interval`` up to ``late_phase_start``, then finer
+    ``late_interval`` after it -- e.g. every 5000 iterations for the first
+    20k of a 30k-iteration run, then every 1000 for the remaining 10k, so
+    expensive sliding-window validation runs less often early on and more
+    often as training approaches convergence. The caller is still expected
+    to also checkpoint unconditionally at ``step == max_iterations``.
+    """
+    if step <= 0:
+        return False
+    interval = early_interval if step <= late_phase_start else late_interval
+    return step % interval == 0
+
+
 def finite_mean(values):
     values = [value for value in values if math.isfinite(value)]
     return float(np.mean(values)) if values else math.nan
