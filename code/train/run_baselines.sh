@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Train + test pCE, CycleMix, SDT-Net, VoxTrust-3D, EFFDNet and DMSPS (stage
-# 1 and stage 2) on ACDC, MSCMR and WORD, plus ModelMix jointly on ACDC+MSCMR,
-# and append every result to one summary CSV.
+# Train + test pCE, CycleMix, SDT-Net, VoxTrust-3D, EFFDNet, SC-MT and DMSPS
+# (stage 1 and stage 2) on ACDC, MSCMR and WORD, plus ModelMix jointly on
+# ACDC+MSCMR, and append every result to one summary CSV.
 #
 # ACDC/MSCMR train as independent 2D slices (anisotropic spacing, the
 # standard protocol in the scribble-supervision literature -- WSL4MIS,
@@ -17,13 +17,14 @@
 #   3. train_sdtnet_2d.py    -> test_pce_2d.py     3. train_sdtnet_3d.py    -> test_pce_3d.py
 #   4. train_voxtrust3d_2d.py-> test_pce_2d.py     4. train_voxtrust3d_3d.py-> test_pce_3d.py
 #   5. train_effdnet_2d.py   -> test_pce_2d.py     5. train_effdnet_3d.py   -> test_pce_3d.py
-#   6. train_dmsps_2d.py     -> test_dmsps_2d.py   6. train_dmsps_3d.py     -> test_dmsps_3d.py
+#   6. train_scmt_2d.py      -> test_pce_2d.py     6. train_scmt_3d.py      -> test_pce_3d.py
+#   7. train_dmsps_2d.py     -> test_dmsps_2d.py   7. train_dmsps_3d.py     -> test_dmsps_3d.py
 #      --stage 1/2 (2)                                --stage 1/2 (2)
-# pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet all checkpoint a plain UNet2D (or
-# VNet3D on WORD) -- VoxTrust-3D's deployed model is its EMA teacher (Sec. 5:
-# "only one EMA network is required at inference"), EFFDNet's is its student
-# -- so all five share the same evaluator; DMSPS's dual-decoder DB-Net
-# (UNetCCT2D / VNetCCT3D) has its own.
+# pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/SC-MT all checkpoint a plain
+# UNet2D (or VNet3D on WORD) -- VoxTrust-3D's and SC-MT's deployed model is
+# their EMA teacher (Mean Teacher: "only one EMA network is required at
+# inference"), EFFDNet's is its student -- so all six share the same
+# evaluator; DMSPS's dual-decoder DB-Net (UNetCCT2D / VNetCCT3D) has its own.
 #
 # ModelMix (Zhang & Patel, MICCAI 2024) is run separately, once, after the
 # per-dataset loop below: it always jointly trains a *pair* of tasks (one
@@ -121,6 +122,10 @@ train_and_test() {
       python "$script_dir/train_effdnet_${dim}.py" --dataset "$dataset" \
         --output_dir "$ckpt_dir" --batch_size "$batch_size" $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
       ;;
+    SCMT)
+      python "$script_dir/train_scmt_${dim}.py" --dataset "$dataset" \
+        --output_dir "$ckpt_dir" --batch_size "$batch_size" $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
+      ;;
     DMSPS)
       python "$script_dir/train_dmsps_${dim}.py" --dataset "$dataset" \
         --output_dir "$ckpt_dir" --batch_size "$batch_size" $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
@@ -133,7 +138,7 @@ train_and_test() {
 
   echo "=== [$method_label] dataset=$dataset ($dim) stage=${stage:-none}: test ==="
   case "$method_label" in
-    pCE|CycleMix|SDTNet|VoxTrust3D|EFFDNet)
+    pCE|CycleMix|SDTNet|VoxTrust3D|EFFDNet|SCMT)
       python "$test_dir/test_pce_${dim}.py" \
         --checkpoint "$ckpt_dir/best.pth" --output_dir "$results_dir" $amp_flag $device_flag $root_path_flag $extra_test_args
       ;;
@@ -166,6 +171,10 @@ for dataset in "${datasets[@]}"; do
   train_and_test EFFDNet "$dataset" "" \
     "$checkpoint_root/ScribbleBench_EFFDNet/$dataset" \
     "$results_root/ScribbleBench_EFFDNet/$dataset"
+
+  train_and_test SCMT "$dataset" "" \
+    "$checkpoint_root/ScribbleBench_SCMT/$dataset" \
+    "$results_root/ScribbleBench_SCMT/$dataset"
 
   dmsps_stage1_ckpt_dir="$checkpoint_root/ScribbleBench_DMSPS/$dataset/stage1"
   train_and_test DMSPS "$dataset" stage1 \

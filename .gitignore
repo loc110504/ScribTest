@@ -12,6 +12,7 @@ env/
 
 # Datasets & large binaries
 dataset/
+data/
 code/data/
 *.h5
 *.nii
