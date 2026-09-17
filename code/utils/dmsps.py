@@ -18,8 +18,18 @@ import torch.nn.functional as F
 from utils.entropy_utils import normalized_entropy
 from utils.sliding_window_3d import _allocate, _gaussian, _scan_starts
 from scipy.ndimage import label as connected_components
+from scipy.ndimage import zoom
 
+_STRUCTURE_8 = np.ones((3, 3), dtype=np.int8)
 _STRUCTURE_26 = np.ones((3, 3, 3), dtype=np.int8)
+
+
+def _connectivity_structure(spatial_ndim):
+    if spatial_ndim == 2:
+        return _STRUCTURE_8
+    if spatial_ndim == 3:
+        return _STRUCTURE_26
+    raise ValueError("Unsupported spatial rank: {}".format(spatial_ndim))
 
 
 def dynamic_mixed_pseudo_label(probs_main, probs_aux, alpha):
@@ -47,21 +57,25 @@ def expand_labels(scribble, mean_probs, ignore_index, tau):
     """Stage-2 uncertainty-guided label expansion (Eq. 5-8).
 
     Args:
-        scribble: ``[D, H, W]`` int64 array, the original sparse scribble
-            (``ignore_index`` where unlabeled).
-        mean_probs: ``[C, D, H, W]`` float32 array, ``p_bar = 0.5*(p1+p2)``
-            averaged over the full volume.
+        scribble: ``[D, H, W]`` (3D volumes) or ``[H, W]`` (2D ACDC/MSCMR
+            slices) int64 array, the original sparse scribble (``ignore_index``
+            where unlabeled).
+        mean_probs: ``[C, D, H, W]`` or ``[C, H, W]`` float32 array, matching
+            ``scribble``'s spatial rank, ``p_bar = 0.5*(p1+p2)``.
         ignore_index: unlabeled class id.
         tau: normalized-entropy threshold below which a voxel is "confident".
 
     Returns:
-        ``[D, H, W]`` int64 expanded label: original scribble is preserved
-        wherever annotated; elsewhere, for every class, only the single
-        largest 26-connected component of that class's confident region is
-        kept as new pseudo-supervision.
+        Int64 expanded label with the same spatial shape as ``scribble``:
+        original scribble is preserved wherever annotated; elsewhere, for
+        every class, only the single largest connected component (26-
+        connectivity in 3D, 8-connectivity in 2D) of that class's confident
+        region is kept as new pseudo-supervision.
     """
-    if mean_probs.ndim != 4:
-        raise ValueError("mean_probs must be [C, D, H, W]")
+    if mean_probs.ndim not in (3, 4):
+        raise ValueError("mean_probs must be [C, H, W] or [C, D, H, W], got ndim={}".format(mean_probs.ndim))
+    spatial_ndim = mean_probs.ndim - 1
+    structure = _connectivity_structure(spatial_ndim)
     num_classes = mean_probs.shape[0]
     entropy = -(mean_probs * np.log(np.clip(mean_probs, 1e-6, None))).sum(axis=0)
     entropy = entropy / np.log(num_classes)
@@ -73,7 +87,7 @@ def expand_labels(scribble, mean_probs, ignore_index, tau):
         candidate = confident & (class_map == class_id)
         if not candidate.any():
             continue
-        labeled, num_components = connected_components(candidate, structure=_STRUCTURE_26)
+        labeled, num_components = connected_components(candidate, structure=structure)
         if num_components == 0:
             continue
         sizes = np.bincount(labeled.ravel())
@@ -163,10 +177,58 @@ def dual_branch_volume_probs(
             temporary.cleanup()
 
 
+@torch.inference_mode()
+def dual_branch_slice_stack_probs(model, image, num_classes, patch_size, device, use_amp=False):
+    """Per-slice 2D counterpart of :func:`dual_branch_volume_probs`.
+
+    ACDC/MSCMR slices are small enough that no sliding window is needed:
+    every slice of ``image`` is independently resized to ``patch_size``
+    (nearest-neighbor, matching ``RandomGenerator2D``/the 2D evaluators),
+    run through the dual-decoder 2D model, and its averaged main/auxiliary
+    softmax probability map is resized back to the slice's native
+    resolution. Returns ``[C, D, H, W]`` -- the same shape
+    :func:`dual_branch_volume_probs` returns for one 3D case -- so
+    :func:`expand_labels` needs no separate 2D call path for DMSPS: a
+    stage-2 expanded label is always built per *case* (its full stack of
+    slices, 26-connectivity across them), never per individual slice; only
+    the underlying forward pass differs between the 2D and 3D pipelines.
+
+    Args:
+        image: ``[D, H, W]`` float32 array, one case's full slice stack
+            (extra leading singleton dims, e.g. ``[1, D, H, W]``, are
+            squeezed away).
+        patch_size: ``(H, W)`` resolution the 2D model was trained at.
+    """
+    image = np.asarray(image)
+    while image.ndim > 3:
+        image = image[0]
+    if image.ndim != 3:
+        raise ValueError("image must be [D, H, W] (after squeezing), got shape {}".format(image.shape))
+    patch_size = tuple(int(value) for value in patch_size)
+    depth, height, width = image.shape
+    probs = np.empty((num_classes, depth, height, width), dtype=np.float32)
+    amp_context = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if use_amp and device.type == "cuda"
+        else nullcontext()
+    )
+    model.eval()
+    for index in range(depth):
+        resized = zoom(image[index], (patch_size[0] / height, patch_size[1] / width), order=0)
+        tensor = torch.from_numpy(resized.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+        with amp_context:
+            main_logits, aux_logits = model(tensor, return_auxiliary=True)
+            mean_probs = 0.5 * (F.softmax(main_logits, dim=1) + F.softmax(aux_logits, dim=1))
+        mean_probs = mean_probs[0].float().cpu().numpy()
+        probs[:, index] = zoom(mean_probs, (1.0, height / patch_size[0], width / patch_size[1]), order=0)
+    return probs
+
+
 __all__ = [
     "dynamic_mixed_pseudo_label",
     "soft_pseudo_supervision_loss",
     "expand_labels",
     "dual_branch_volume_probs",
+    "dual_branch_slice_stack_probs",
     "normalized_entropy",
 ]

@@ -1,24 +1,27 @@
-"""VNetCCT3D + DMSPS (Han et al., Medical Image Analysis 2024) on WORD's
-full-3D protocol.
+"""UNetCCT2D + DMSPS (Han et al., Medical Image Analysis 2024) on ACDC/
+MSCMR's 2D slice-supervised protocol.
 
-Reimplements DMSPS's two-stage recipe on top of this repository's dual-decoder
-``VNetCCT3D`` (shared VNet encoder, one clean decoder, one decoder fed
-``dropout3d``-perturbed features -- the DB-Net architecture DMSPS uses, on a
-VNet backbone instead of a concatenation-skip 3D U-Net) and
-``ScribbleBench3DDataset``. See ``code/utils/dmsps.py`` for the loss and
-label-expansion implementation, verified against the official
-``HiLab-git/DMSPS`` source. ACDC/MSCMR train as independent 2D slices
-instead; see ``train_dmsps_2d.py``.
+Reuses ``dmsps_step`` from ``train_dmsps_3d.py`` unchanged (dual-branch pCE +
+dynamically mixed soft pseudo-label consistency is elementwise/softmax-only
+math with no 3D-specific assumption, see ``code/utils/dmsps.py``), and
+``UNetCCT2D`` (``networks/unet_2d.py``) is the same shared-encoder /
+main-decoder / dropout-perturbed-auxiliary-decoder DB-Net architecture as
+``UNetCCT3D``, one spatial dimension down.
 
-Stage 1 trains DB-Net directly on the sparse scribble with pCE + a dynamically
-mixed soft pseudo-label consistency term. Stage 2 re-initializes DB-Net from
-the stage-1 checkpoint and retrains it with the same loss, but the scribble is
-first expanded with high-confidence, largest-connected-component predictions
-from stage 1 (``--stage 2 --init_checkpoint <stage1 best.pth>``).
+Stage 1 trains DB-Net directly on the sparse scribble with pCE + a
+dynamically mixed soft pseudo-label consistency term. Stage 2 re-initializes
+DB-Net from the stage-1 checkpoint and retrains it with the same loss, but
+the scribble is first expanded with high-confidence, largest-connected-
+component predictions from stage 1 (``--stage 2 --init_checkpoint <stage1
+best.pth>``) -- per *case* (its full slice stack, 26-connectivity across
+slices, exactly like the 3D pipeline), using
+``utils.dmsps.dual_branch_slice_stack_probs`` for the per-slice forward pass
+instead of 3D sliding-window inference.
 
 Only sparse (stage 1) or expanded (stage 2) labels contribute to
 optimization. Dense training labels are accessed exclusively for model
-selection on a patient-level holdout, exactly as in ``train_pce_3d.py``.
+selection on a patient-level holdout, exactly as in ``train_pce_2d.py``.
+WORD stays a full-3D VNet pipeline, see ``train_dmsps_3d.py``.
 """
 
 import argparse
@@ -31,7 +34,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
@@ -41,37 +43,25 @@ REPO_ROOT = CODE_DIR.parent
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
-from dataloader.scribblebench_3d import (  # noqa: E402
-    DATASET_CONFIGS,
-    RandomGenerator3D,
-    ScribbleBench3DDataset,
-)
-from networks.vnet_3d import VNetCCT3D  # noqa: E402
-from train.common_3d import (  # noqa: E402
-    atomic_torch_save,
-    checkpoint_due,
-    make_published_split,
-    partial_cross_entropy,
-    seed_everything,
-    seed_worker,
-    validate,
-)
-from utils.dmsps import (  # noqa: E402
-    dual_branch_volume_probs,
-    dynamic_mixed_pseudo_label,
-    expand_labels,
-    soft_pseudo_supervision_loss,
-)
+from dataloader.scribblebench_2d import RandomGenerator2D, ScribbleBench2DDataset  # noqa: E402
+from dataloader.scribblebench_3d import DATASET_CONFIGS  # noqa: E402
+from networks.unet_2d import UNetCCT2D  # noqa: E402
+from train.common_2d import validate_2d  # noqa: E402
+from train.common_3d import atomic_torch_save, checkpoint_due, seed_everything, seed_worker  # noqa: E402
+from train.train_dmsps_3d import dmsps_step  # noqa: E402
+from train.train_pce_2d import build_val_dataset, resolve_case_split  # noqa: E402
+from utils.dmsps import dual_branch_slice_stack_probs, expand_labels  # noqa: E402
 
-SUPPORTED_DATASETS = ("WORD",)
+SUPPORTED_DATASETS = ("ACDC", "MSCMR")
 DEFAULTS = {
-    "WORD": {"patch_size": (64, 96, 96), "batch_size": 1, "tau": 0.3},
+    "ACDC": {"patch_size": (256, 256), "batch_size": 24, "tau": 0.1},
+    "MSCMR": {"patch_size": (256, 256), "batch_size": 24, "tau": 0.1},
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a dual-decoder 3D VNet from ScribbleBench scribbles with DMSPS"
+        description="Train a 2D dual-decoder U-Net from ScribbleBench scribbles with DMSPS"
     )
     parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS)
     parser.add_argument("--stage", type=int, required=True, choices=(1, 2))
@@ -84,8 +74,8 @@ def parse_args():
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--max_iterations", type=int, default=30000)
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--patch_size", nargs=3, type=int, default=None, metavar=("D", "H", "W"))
-    parser.add_argument("--n_filters", type=int, default=16, help="VNet base channel width")
+    parser.add_argument("--patch_size", nargs=2, type=int, default=None, metavar=("H", "W"))
+    parser.add_argument("--feature_channels", nargs="+", type=int, default=(16, 32, 64, 128, 256))
     parser.add_argument("--learning_rate", type=float, default=1e-2)
     parser.add_argument("--momentum", type=float, default=0.99)
     parser.add_argument("--weight_decay", type=float, default=3e-5)
@@ -101,18 +91,12 @@ def parse_args():
         "--late_phase_start", type=int, default=20000,
         help="iteration at which the finer --late_interval cadence begins",
     )
-    parser.add_argument("--val_overlap", type=float, default=0.5)
-    parser.add_argument("--sw_batch_size", type=int, default=1)
-    parser.add_argument("--max_accumulator_mb", type=int, default=1024)
-    parser.add_argument("--temp_dir", default=None)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--foreground_crop_prob", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", default=None)
 
-    # DMSPS-specific hyperparameters (paper defaults).
     parser.add_argument("--lambda_sps", type=float, default=8.0)
     parser.add_argument("--dropout_p", type=float, default=0.5, help="auxiliary-decoder feature dropout rate")
     parser.add_argument(
@@ -127,32 +111,21 @@ def validate_args(args):
     args.patch_size = tuple(args.patch_size or defaults["patch_size"])
     args.batch_size = args.batch_size or defaults["batch_size"]
     args.tau = args.tau if args.tau is not None else defaults["tau"]
+    args.feature_channels = tuple(args.feature_channels)
     if args.stage == 2 and not args.init_checkpoint:
         raise ValueError("--stage 2 requires --init_checkpoint pointing at a stage-1 best.pth")
     if args.max_iterations < 1 or args.batch_size < 1:
         raise ValueError("max_iterations and batch_size must be positive")
-    if args.n_filters < 1:
-        raise ValueError("n_filters must be positive")
+    if len(args.feature_channels) != 5 or any(value < 1 for value in args.feature_channels):
+        raise ValueError("feature_channels must contain five positive integers")
     if any(value < 1 for value in args.patch_size):
         raise ValueError("patch_size values must be positive")
-    # VNetCCT3D downsamples D/H/W uniformly by 16 (4 stride-2 stages).
     if any(size % 16 for size in args.patch_size):
-        raise ValueError("patch_size must be divisible by 16 in DHW order")
-    bottleneck_shape = [size // 16 for size in args.patch_size]
-    if np.prod(bottleneck_shape) <= 1:
-        raise ValueError("patch_size produces a one-voxel bottleneck, which BatchNorm3d cannot use")
+        raise ValueError("patch_size must be divisible by 16")
     if args.early_interval < 1 or args.late_interval < 1 or args.num_workers < 0:
         raise ValueError("early_interval/late_interval must be positive and num_workers non-negative")
     if args.late_phase_start < 0:
         raise ValueError("late_phase_start must be non-negative")
-    if not 0 <= args.val_overlap < 1:
-        raise ValueError("val_overlap must satisfy 0 <= val_overlap < 1")
-    if not 0 <= args.foreground_crop_prob <= 1:
-        raise ValueError("foreground_crop_prob must satisfy 0 <= p <= 1")
-    if args.sw_batch_size < 1 or args.max_accumulator_mb < 0:
-        raise ValueError("invalid sliding-window settings")
-    if args.temp_dir is not None and not Path(args.temp_dir).is_dir():
-        raise ValueError("temp_dir does not exist: {}".format(args.temp_dir))
     if not 0 < args.dropout_p < 1:
         raise ValueError("dropout_p must satisfy 0 < p < 1")
     if not 0 < args.tau <= 1:
@@ -160,31 +133,13 @@ def validate_args(args):
     return args
 
 
-def dmsps_step(model, image, target, ignore_index, args):
-    """One DMSPS forward pass; returns the total loss and its components."""
-    main_logits, aux_logits = model(image, return_auxiliary=True)
-    loss_pce_main, labeled_voxels = partial_cross_entropy(main_logits, target, ignore_index)
-    loss_pce_aux, _ = partial_cross_entropy(aux_logits, target, ignore_index)
-    loss_pce = 0.5 * (loss_pce_main + loss_pce_aux)
+class ExpandedLabel2DDataset(Dataset):
+    """Swaps in a stage-2 expanded label for every slice whose case has one.
 
-    probs_main = F.softmax(main_logits, dim=1)
-    probs_aux = F.softmax(aux_logits, dim=1)
-    alpha = float(np.random.uniform(0.0, 1.0))
-    pseudo_target = dynamic_mixed_pseudo_label(probs_main, probs_aux, alpha)
-    loss_sps = soft_pseudo_supervision_loss(probs_main, probs_aux, pseudo_target)
-
-    total = loss_pce + args.lambda_sps * loss_sps
-    components = {
-        "pce": loss_pce.item(),
-        "sps": loss_sps.item(),
-        "alpha": alpha,
-        "labeled_voxels": labeled_voxels.item(),
-    }
-    return total, components
-
-
-class ExpandedLabelDataset(Dataset):
-    """Swaps in a stage-2 expanded label for every case that has one."""
+    2D counterpart of ``train_dmsps_3d.py``'s ``ExpandedLabelDataset``, built
+    directly on ``ScribbleBench2DDataset``'s public per-volume caches instead
+    of re-deriving per-slice access.
+    """
 
     def __init__(self, base_dataset, expanded_labels, transform):
         self.base_dataset = base_dataset
@@ -195,55 +150,60 @@ class ExpandedLabelDataset(Dataset):
         return len(self.base_dataset)
 
     def __getitem__(self, index):
-        sample = self.base_dataset[index]
-        expanded = self.expanded_labels.get(sample["case"])
-        if expanded is not None:
-            sample = dict(sample)
-            sample["label"] = expanded
+        volume_index, slice_index = self.base_dataset.slice_index[index]
+        case = self.base_dataset.cases[volume_index]
+        expanded = self.expanded_labels.get(case)
+        label = expanded[slice_index] if expanded is not None else self.base_dataset.labels[volume_index][slice_index]
+        sample = {
+            "image": self.base_dataset.images[volume_index][slice_index],
+            "label": label,
+            "idx": index,
+            "case": case,
+            "slice_index": slice_index,
+            "spacing": self.base_dataset.spacings[volume_index],
+            "num_classes": self.base_dataset.num_classes,
+            "ignore_index": self.base_dataset.ignore_index,
+            "is_scribble": self.base_dataset.is_scribble[volume_index],
+        }
         return self.transform(sample)
 
 
-def build_stage2_labels(model, raw_dataset, train_indices, ignore_index, args, device):
-    """Run stage-1 DB-Net over every training case and expand its scribble."""
+def build_stage2_labels(model, raw_dataset, train_case_indices, ignore_index, args, device):
+    """Run stage-1 DB-Net over every training case's full slice stack and
+    expand its scribble, per case (26-connectivity across the case's slices,
+    exactly matching the 3D pipeline's granularity)."""
     expanded_labels = {}
     model.eval()
-    for index in tqdm(train_indices, desc="stage2 label expansion", leave=False):
-        sample = raw_dataset[index]
-        image = torch.from_numpy(sample["image"]).unsqueeze(0).unsqueeze(0).float()
-        mean_probs = dual_branch_volume_probs(
+    for volume_index in tqdm(train_case_indices, desc="stage2 label expansion", leave=False):
+        mean_probs = dual_branch_slice_stack_probs(
             model=model,
-            image=image,
+            image=raw_dataset.images[volume_index],
             num_classes=raw_dataset.num_classes,
             patch_size=args.patch_size,
             device=device,
-            overlap=args.val_overlap,
-            sw_batch_size=args.sw_batch_size,
             use_amp=args.amp,
-            max_accumulator_mb=args.max_accumulator_mb,
-            temp_dir=args.temp_dir,
         )
-        expanded_labels[sample["case"]] = expand_labels(
-            sample["label"], mean_probs, ignore_index, args.tau
-        )
+        case = raw_dataset.cases[volume_index]
+        expanded_labels[case] = expand_labels(raw_dataset.labels[volume_index], mean_probs, ignore_index, args.tau)
     return expanded_labels
 
 
 def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
     return {
         "schema_version": 1,
-        "model_name": "vnet_cct_3d",
+        "model_name": "unet_cct_2d",
         "training_method": "dmsps_stage{}".format(args.stage),
         "model_config": {
             "in_chns": 1,
             "class_num": len(DATASET_CONFIGS[args.dataset]["class_names"]),
-            "n_filters": args.n_filters,
+            "feature_chns": list(args.feature_channels),
             "perturbations": ["dropout"],
             "perturbation_dropout": args.dropout_p,
         },
         "data_config": {
             "dataset": args.dataset,
             "root_path": str(args.root_path) if args.root_path else None,
-            "patch_size_dhw": list(args.patch_size),
+            "patch_size_hw": list(args.patch_size),
             "ignore_index": DATASET_CONFIGS[args.dataset]["ignore_index"],
         },
         "global_step": step,
@@ -260,8 +220,8 @@ def restore_checkpoint(path, model, optimizer, scaler, args, split):
     checkpoint = torch.load(path, map_location="cpu")
     expected_model = checkpoint.get("model_config", {})
     expected_data = checkpoint.get("data_config", {})
-    if expected_model.get("n_filters") != args.n_filters:
-        raise ValueError("resume checkpoint n_filters does not match")
+    if expected_model.get("feature_chns") != list(args.feature_channels):
+        raise ValueError("resume checkpoint feature_channels do not match")
     if expected_data.get("dataset") != args.dataset:
         raise ValueError("resume checkpoint dataset does not match")
     if checkpoint.get("split") != split:
@@ -299,33 +259,32 @@ def train(args):
         logging.warning("AMP requested on %s; disabling AMP", device)
         args.amp = False
 
-    train_transform = RandomGenerator3D(args.patch_size, foreground_prob=args.foreground_crop_prob)
-    raw_train_dataset = ScribbleBench3DDataset(
+    train_transform = RandomGenerator2D(args.patch_size)
+    raw_train_dataset = ScribbleBench2DDataset(
         args.dataset, base_dir=args.root_path, split="train", sup_type="scribble", transform=None
     )
-    val_dataset = ScribbleBench3DDataset(
-        args.dataset, base_dir=args.root_path, split="train", sup_type="scribble", return_full_label=True
-    )
-    train_indices, val_indices, train_groups, val_groups, protocol = make_published_split(
-        raw_train_dataset.samples, args.dataset
+    val_dataset = build_val_dataset(args)
+
+    train_case_indices, val_case_indices, train_groups, val_groups, protocol = resolve_case_split(
+        raw_train_dataset.cases, args.dataset
     )
     split = {
         "protocol": protocol,
         "grouped_by_patient": True,
         "train_groups": train_groups,
         "val_groups": val_groups,
-        "train_cases": [raw_train_dataset.samples[index]["case"] for index in train_indices],
-        "val_cases": [raw_train_dataset.samples[index]["case"] for index in val_indices],
+        "train_cases": [raw_train_dataset.cases[index] for index in train_case_indices],
+        "val_cases": [raw_train_dataset.cases[index] for index in val_case_indices],
     }
     with (output_dir / "split.json").open("w", encoding="utf-8") as handle:
         json.dump(split, handle, indent=2)
 
     num_classes = raw_train_dataset.num_classes
     ignore_index = raw_train_dataset.ignore_index
-    model = VNetCCT3D(
+    model = UNetCCT2D(
         in_chns=1,
         class_num=num_classes,
-        n_filters=args.n_filters,
+        feature_chns=args.feature_channels,
         perturbations=("dropout",),
         perturbation_dropout=args.dropout_p,
     ).to(device)
@@ -335,16 +294,17 @@ def train(args):
         init_checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
         model.load_state_dict(init_checkpoint["model_state_dict"], strict=True)
         logging.info("Initialized DB-Net from %s", args.init_checkpoint)
-        expanded_labels = build_stage2_labels(model, raw_train_dataset, train_indices, ignore_index, args, device)
+        expanded_labels = build_stage2_labels(model, raw_train_dataset, train_case_indices, ignore_index, args, device)
         num_expanded = sum(
             int(np.count_nonzero(label != ignore_index)) for label in expanded_labels.values()
         )
-        logging.info("Stage-2 label expansion: %d cases, %d annotated voxels total", len(expanded_labels), num_expanded)
+        logging.info("Stage-2 label expansion: %d cases, %d annotated slice-pixels total", len(expanded_labels), num_expanded)
 
-    train_dataset = ExpandedLabelDataset(raw_train_dataset, expanded_labels, train_transform)
+    train_dataset = ExpandedLabel2DDataset(raw_train_dataset, expanded_labels, train_transform)
+    train_slice_positions = raw_train_dataset.slice_positions_for_volumes(train_case_indices)
     generator = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
-        Subset(train_dataset, train_indices),
+        Subset(train_dataset, train_slice_positions),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -369,8 +329,9 @@ def train(args):
             raise ValueError("resume checkpoint already reached max_iterations; increase --max_iterations")
 
     logging.info(
-        "dataset=%s stage=%d classes=%d ignore=%d train=%d val=%d patch=%s device=%s",
-        args.dataset, args.stage, num_classes, ignore_index, len(train_indices), len(val_indices), args.patch_size, device,
+        "dataset=%s stage=%d classes=%d ignore=%d train_slices=%d val_cases=%d patch=%s device=%s",
+        args.dataset, args.stage, num_classes, ignore_index, len(train_slice_positions), len(val_case_indices),
+        args.patch_size, device,
     )
     writer = SummaryWriter(str(output_dir / "tensorboard"))
     metrics_path = output_dir / "validation.jsonl"
@@ -412,7 +373,7 @@ def train(args):
                     or step == args.max_iterations
                 )
                 if should_checkpoint:
-                    result = validate(model, val_dataset, val_indices, args, device, num_classes)
+                    result = validate_2d(model, val_dataset, val_case_indices, args, device, num_classes)
                     last_eval_step = step
                     score = result["mean_dice"]
                     if not math.isfinite(score):

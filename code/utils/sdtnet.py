@@ -76,19 +76,23 @@ def soft_dice_loss(probs, target, num_classes, ignore_index):
     reference), restricted to voxels where ``target != ignore_index``.
 
     Args:
-        probs: ``[B, C, D, H, W]`` softmax probabilities.
-        target: ``[B, D, H, W]`` integer labels (may contain ``ignore_index``).
+        probs: ``[B, C, D, H, W]`` (3D) or ``[B, C, H, W]`` (2D ACDC/MSCMR
+            slices) softmax probabilities.
+        target: ``[B, D, H, W]`` or ``[B, H, W]`` integer labels, matching
+            ``probs``'s spatial rank (may contain ``ignore_index``).
     """
-    if probs.ndim != 5 or target.shape != probs.shape[:1] + probs.shape[2:]:
+    if probs.ndim not in (4, 5) or target.shape != probs.shape[:1] + probs.shape[2:]:
         raise ValueError(
-            "Expected probs [B,C,D,H,W] and target [B,D,H,W], got {} and {}".format(
+            "Expected probs [B,C,H,W] or [B,C,D,H,W] and a matching target, got {} and {}".format(
                 tuple(probs.shape), tuple(target.shape)
             )
         )
+    spatial_ndim = probs.ndim - 2
     smooth = 1e-5
     valid = (target != ignore_index).float()
     safe_target = torch.where(target == ignore_index, torch.zeros_like(target), target)
-    one_hot = F.one_hot(safe_target.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+    permute_order = (0, spatial_ndim + 1) + tuple(range(1, spatial_ndim + 1))
+    one_hot = F.one_hot(safe_target.long(), num_classes=num_classes).permute(*permute_order).float()
 
     losses = []
     for class_id in range(num_classes):

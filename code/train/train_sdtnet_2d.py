@@ -1,17 +1,18 @@
-"""VNet3D + SDT-Net (Nguyen et al. 2026) on WORD's full-3D protocol.
+"""UNet2D + SDT-Net (Nguyen et al. 2026) on ACDC/MSCMR's 2D slice-supervised
+protocol.
 
-Reimplements SDT-Net's dual-teacher/single-student framework -- Dynamic
-Teacher Switching (DTS), Pick Reliable Pixels (PRP) pseudo-labeling and
-Hierarchical Consistency (HiCo) feature alignment -- on top of this
-repository's ``VNet3D`` and ``ScribbleBench3DDataset``; see
-``code/utils/sdtnet.py`` for the two spots where an earlier 2D prototype's
-*dependencies* (not the method itself) turned out to have real bugs that are
-fixed here instead of reproduced. ACDC/MSCMR train as independent 2D slices
-instead; see ``train_sdtnet_2d.py``.
+Reuses ``sdtnet_step`` from ``train_sdtnet_3d.py`` unchanged: Dynamic Teacher
+Switching, Pick Reliable Pixels and Hierarchical Consistency are all
+elementwise/feature-flatten operations with no 3D-specific assumption (see
+``utils/sdtnet.py``), and ``UNet2D``/``UNetCCT2D`` (``networks/unet_2d.py``)
+support the same ``return_features=True`` contract as their 3D counterparts,
+so the exact same dual-teacher/single-student framework applies to 2D
+patches with no changes.
 
 Only sparse labels in ``labelsTr`` contribute to optimization. Dense training
 labels are accessed exclusively for model selection on a patient-level
-holdout, exactly as in ``train_pce_3d.py``.
+holdout, exactly as in ``train_pce_2d.py``. WORD stays a full-3D VNet
+pipeline, see ``train_sdtnet_3d.py``.
 """
 
 import argparse
@@ -22,9 +23,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader, Subset
 
@@ -33,43 +32,36 @@ REPO_ROOT = CODE_DIR.parent
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
-from dataloader.scribblebench_3d import (  # noqa: E402
-    DATASET_CONFIGS,
-    RandomGenerator3D,
-    ScribbleBench3DDataset,
-)
-from networks.vnet_3d import VNet3D  # noqa: E402
-from train.common_3d import (  # noqa: E402
-    atomic_torch_save,
-    checkpoint_due,
-    make_published_split,
-    partial_cross_entropy,
-    seed_everything,
-    seed_worker,
-    validate,
-)
-from utils.sdtnet import TeacherEMA, feature_consistency_loss, pick_reliable_pixels, soft_dice_loss  # noqa: E402
+from dataloader.scribblebench_2d import RandomGenerator2D, ScribbleBench2DDataset  # noqa: E402
+from dataloader.scribblebench_3d import DATASET_CONFIGS  # noqa: E402
+from networks.unet_2d import UNet2D  # noqa: E402
+from train.common_2d import validate_2d  # noqa: E402
+from train.common_3d import atomic_torch_save, checkpoint_due, seed_everything, seed_worker  # noqa: E402
+from train.train_pce_2d import build_val_dataset, resolve_case_split  # noqa: E402
+from train.train_sdtnet_3d import sdtnet_step  # noqa: E402
+from utils.sdtnet import TeacherEMA  # noqa: E402
 
-SUPPORTED_DATASETS = ("WORD",)
+SUPPORTED_DATASETS = ("ACDC", "MSCMR")
 DEFAULTS = {
-    "WORD": {"patch_size": (64, 96, 96), "batch_size": 1},
+    "ACDC": {"patch_size": (256, 256), "batch_size": 24},
+    "MSCMR": {"patch_size": (256, 256), "batch_size": 24},
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a 3D VNet from ScribbleBench scribbles with SDT-Net"
+        description="Train a 2D U-Net from ScribbleBench scribbles with SDT-Net"
     )
     parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS)
     parser.add_argument("--root_path", default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--max_iterations", type=int, default=30000)
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--patch_size", nargs=3, type=int, default=None, metavar=("D", "H", "W"))
-    parser.add_argument("--n_filters", type=int, default=16, help="VNet base channel width")
+    parser.add_argument("--patch_size", nargs=2, type=int, default=None, metavar=("H", "W"))
+    parser.add_argument("--feature_channels", nargs="+", type=int, default=(16, 32, 64, 128, 256))
     parser.add_argument("--learning_rate", type=float, default=1e-2)
-    parser.add_argument("--momentum", type=float, default=0.99)
-    parser.add_argument("--weight_decay", type=float, default=3e-5)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument(
         "--early_interval", type=int, default=5000,
         help="eval+checkpoint cadence for iterations <= --late_phase_start",
@@ -82,18 +74,12 @@ def parse_args():
         "--late_phase_start", type=int, default=20000,
         help="iteration at which the finer --late_interval cadence begins",
     )
-    parser.add_argument("--val_overlap", type=float, default=0.5)
-    parser.add_argument("--sw_batch_size", type=int, default=1)
-    parser.add_argument("--max_accumulator_mb", type=int, default=1024)
-    parser.add_argument("--temp_dir", default=None)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--foreground_crop_prob", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", default=None)
 
-    # SDT-Net-specific hyperparameters (matching train_sdtnet_2d.py exactly).
     parser.add_argument("--confidence_threshold", type=float, default=0.5, help="PRP threshold tau")
     parser.add_argument("--ema_alpha", type=float, default=0.99, help="teacher EMA decay rate")
     parser.add_argument(
@@ -107,30 +93,19 @@ def validate_args(args):
     defaults = DEFAULTS[args.dataset]
     args.patch_size = tuple(args.patch_size or defaults["patch_size"])
     args.batch_size = args.batch_size or defaults["batch_size"]
+    args.feature_channels = tuple(args.feature_channels)
     if args.max_iterations < 1 or args.batch_size < 1:
         raise ValueError("max_iterations and batch_size must be positive")
-    if args.n_filters < 1:
-        raise ValueError("n_filters must be positive")
+    if len(args.feature_channels) != 5 or any(value < 1 for value in args.feature_channels):
+        raise ValueError("feature_channels must contain five positive integers")
     if any(value < 1 for value in args.patch_size):
         raise ValueError("patch_size values must be positive")
-    # VNet3D downsamples D/H/W uniformly by 16 (4 stride-2 stages).
     if any(size % 16 for size in args.patch_size):
-        raise ValueError("patch_size must be divisible by 16 in DHW order")
-    bottleneck_shape = [size // 16 for size in args.patch_size]
-    if np.prod(bottleneck_shape) <= 1:
-        raise ValueError("patch_size produces a one-voxel bottleneck, which BatchNorm3d cannot use")
+        raise ValueError("patch_size must be divisible by 16")
     if args.early_interval < 1 or args.late_interval < 1 or args.num_workers < 0:
         raise ValueError("early_interval/late_interval must be positive and num_workers non-negative")
     if args.late_phase_start < 0:
         raise ValueError("late_phase_start must be non-negative")
-    if not 0 <= args.val_overlap < 1:
-        raise ValueError("val_overlap must satisfy 0 <= val_overlap < 1")
-    if not 0 <= args.foreground_crop_prob <= 1:
-        raise ValueError("foreground_crop_prob must satisfy 0 <= p <= 1")
-    if args.sw_batch_size < 1 or args.max_accumulator_mb < 0:
-        raise ValueError("invalid sliding-window settings")
-    if args.temp_dir is not None and not Path(args.temp_dir).is_dir():
-        raise ValueError("temp_dir does not exist: {}".format(args.temp_dir))
     if not 0 < args.confidence_threshold < 1:
         raise ValueError("confidence_threshold must satisfy 0 < tau < 1")
     if not 0 < args.ema_alpha < 1:
@@ -138,72 +113,20 @@ def validate_args(args):
     return args
 
 
-def sdtnet_step(student, teacher1, teacher2, image, target, ignore_index, num_classes, args):
-    """One SDT-Net forward pass; returns the total loss, the selected
-    teacher id (1 or 2, for the caller to EMA-update), and loss components.
-    """
-    with torch.no_grad():
-        logits_t1, feats_t1 = teacher1(image, return_features=True)
-        logits_t2, feats_t2 = teacher2(image, return_features=True)
-        loss_t1, _ = partial_cross_entropy(logits_t1, target, ignore_index)
-        loss_t2, _ = partial_cross_entropy(logits_t2, target, ignore_index)
-
-        # Dynamic Teacher Switching (Eq. 3-4): pick the teacher with the
-        # lower scribble pCE loss for this batch as the reliable teacher.
-        if loss_t1.item() < loss_t2.item():
-            selected = 1
-            probs_teacher = F.softmax(logits_t1, dim=1)
-            high_teacher, low_teacher = feats_t1["decoder"][0], feats_t1["decoder"][-1]
-        else:
-            selected = 2
-            probs_teacher = F.softmax(logits_t2, dim=1)
-            high_teacher, low_teacher = feats_t2["decoder"][0], feats_t2["decoder"][-1]
-        pseudo_label = pick_reliable_pixels(probs_teacher, args.confidence_threshold, ignore_index)
-
-    logits_s, feats_s = student(image, return_features=True)
-    probs_s = F.softmax(logits_s, dim=1)
-    high_student, low_student = feats_s["decoder"][0], feats_s["decoder"][-1]
-
-    loss_scribble, labeled_voxels = partial_cross_entropy(logits_s, target, ignore_index)
-
-    loss_pseudo_ce, pseudo_voxels = partial_cross_entropy(logits_s, pseudo_label, ignore_index)
-    loss_pseudo_dice = soft_dice_loss(probs_s, pseudo_label, num_classes, ignore_index)
-    loss_pseudo = loss_pseudo_ce + loss_pseudo_dice
-
-    loss_high = feature_consistency_loss(high_student, high_teacher)
-    loss_low = feature_consistency_loss(low_student, low_teacher)
-
-    # Eq. 9: L_Total = L_Scribble + L_Pseudo + L_HiCo, where L_Pseudo already
-    # carries Eq. 6's internal 0.5 and L_HiCo carries Eq. 8's internal 0.5
-    # (both folded into the *0.5 factors here to match train_sdtnet_2d.py's
-    # `loss_pseudo * 0.5` / `(loss_low + loss_high) * 0.5` exactly).
-    total = loss_scribble + 0.5 * loss_pseudo + 0.5 * (loss_low + loss_high)
-    components = {
-        "scribble": loss_scribble.item(),
-        "pseudo": loss_pseudo.item(),
-        "hico_low": loss_low.item(),
-        "hico_high": loss_high.item(),
-        "labeled_voxels": labeled_voxels.item(),
-        "pseudo_voxels": pseudo_voxels.item(),
-        "selected_teacher": selected,
-    }
-    return total, selected, components
-
-
 def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
     return {
         "schema_version": 1,
-        "model_name": "vnet_3d",
+        "model_name": "unet_2d",
         "training_method": "sdtnet",
         "model_config": {
             "in_chns": 1,
             "class_num": len(DATASET_CONFIGS[args.dataset]["class_names"]),
-            "n_filters": args.n_filters,
+            "feature_chns": list(args.feature_channels),
         },
         "data_config": {
             "dataset": args.dataset,
             "root_path": str(args.root_path) if args.root_path else None,
-            "patch_size_dhw": list(args.patch_size),
+            "patch_size_hw": list(args.patch_size),
             "ignore_index": DATASET_CONFIGS[args.dataset]["ignore_index"],
         },
         "global_step": step,
@@ -220,8 +143,8 @@ def restore_checkpoint(path, model, optimizer, scaler, args, split):
     checkpoint = torch.load(path, map_location="cpu")
     expected_model = checkpoint.get("model_config", {})
     expected_data = checkpoint.get("data_config", {})
-    if expected_model.get("n_filters") != args.n_filters:
-        raise ValueError("resume checkpoint n_filters does not match")
+    if expected_model.get("feature_chns") != list(args.feature_channels):
+        raise ValueError("resume checkpoint feature_channels do not match")
     if expected_data.get("dataset") != args.dataset:
         raise ValueError("resume checkpoint dataset does not match")
     if checkpoint.get("split") != split:
@@ -258,30 +181,30 @@ def train(args):
         logging.warning("AMP requested on %s; disabling AMP", device)
         args.amp = False
 
-    train_transform = RandomGenerator3D(args.patch_size, foreground_prob=args.foreground_crop_prob)
-    train_dataset = ScribbleBench3DDataset(
+    train_transform = RandomGenerator2D(args.patch_size)
+    train_dataset = ScribbleBench2DDataset(
         args.dataset, base_dir=args.root_path, split="train", sup_type="scribble", transform=train_transform
     )
-    val_dataset = ScribbleBench3DDataset(
-        args.dataset, base_dir=args.root_path, split="train", sup_type="scribble", return_full_label=True
-    )
-    train_indices, val_indices, train_groups, val_groups, protocol = make_published_split(
-        train_dataset.samples, args.dataset
+    val_dataset = build_val_dataset(args)
+
+    train_case_indices, val_case_indices, train_groups, val_groups, protocol = resolve_case_split(
+        train_dataset.cases, args.dataset
     )
     split = {
         "protocol": protocol,
         "grouped_by_patient": True,
         "train_groups": train_groups,
         "val_groups": val_groups,
-        "train_cases": [train_dataset.samples[index]["case"] for index in train_indices],
-        "val_cases": [train_dataset.samples[index]["case"] for index in val_indices],
+        "train_cases": [train_dataset.cases[index] for index in train_case_indices],
+        "val_cases": [train_dataset.cases[index] for index in val_case_indices],
     }
     with (output_dir / "split.json").open("w", encoding="utf-8") as handle:
         json.dump(split, handle, indent=2)
 
+    train_slice_positions = train_dataset.slice_positions_for_volumes(train_case_indices)
     generator = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
-        Subset(train_dataset, train_indices),
+        Subset(train_dataset, train_slice_positions),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -297,9 +220,9 @@ def train(args):
     num_classes = train_dataset.num_classes
     ignore_index = train_dataset.ignore_index
 
-    student = VNet3D(in_chns=1, class_num=num_classes, n_filters=args.n_filters).to(device)
-    teacher1 = VNet3D(in_chns=1, class_num=num_classes, n_filters=args.n_filters).to(device)
-    teacher2 = VNet3D(in_chns=1, class_num=num_classes, n_filters=args.n_filters).to(device)
+    student = UNet2D(in_chns=1, class_num=num_classes, feature_chns=args.feature_channels).to(device)
+    teacher1 = UNet2D(in_chns=1, class_num=num_classes, feature_chns=args.feature_channels).to(device)
+    teacher2 = UNet2D(in_chns=1, class_num=num_classes, feature_chns=args.feature_channels).to(device)
     for teacher in (teacher1, teacher2):
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
@@ -319,8 +242,9 @@ def train(args):
             raise ValueError("resume checkpoint already reached max_iterations; increase --max_iterations")
 
     logging.info(
-        "dataset=%s classes=%d ignore=%d train=%d val=%d patch=%s device=%s",
-        args.dataset, num_classes, ignore_index, len(train_indices), len(val_indices), args.patch_size, device,
+        "dataset=%s classes=%d ignore=%d train_slices=%d val_cases=%d patch=%s device=%s",
+        args.dataset, num_classes, ignore_index, len(train_slice_positions), len(val_case_indices),
+        args.patch_size, device,
     )
     writer = SummaryWriter(str(output_dir / "tensorboard"))
     metrics_path = output_dir / "validation.jsonl"
@@ -366,7 +290,7 @@ def train(args):
                     or step == args.max_iterations
                 )
                 if should_checkpoint:
-                    result = validate(student, val_dataset, val_indices, args, device, num_classes)
+                    result = validate_2d(student, val_dataset, val_case_indices, args, device, num_classes)
                     last_eval_step = step
                     score = result["mean_dice"]
                     if not math.isfinite(score):

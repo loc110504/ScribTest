@@ -1,16 +1,16 @@
-"""VNet3D + CycleMix (Zhang & Zhuang, CVPR 2022) on WORD's full-3D protocol.
+"""UNet2D + CycleMix (Zhang & Zhuang, CVPR 2022) on ACDC/MSCMR's 2D
+slice-supervised protocol.
 
-Reimplements CycleMix's four-loss framework -- unmix pCE, mix pCE, global
-mix-invariance consistency and local connectivity consistency -- on top of
-this repository's ``VNet3D`` and ``ScribbleBench3DDataset``. See
-``code/utils/cyclemix.py`` for the exact 3D adaptation notes (in particular,
-the official Puzzle Mix solver is replaced with a 3D cuboid CutMix, which the
-paper lists as an admissible mix operator). ACDC/MSCMR train as independent
-2D slices instead; see ``train_cyclemix_2d.py``.
+Reuses ``cyclemix_step`` from ``train_cyclemix_3d.py`` unchanged: every loss
+term it composes (``utils/cyclemix.py``'s mix/occlude/cuboid-mask/largest-
+component helpers) is shape-agnostic over the spatial rank, so the exact same
+four-loss framework -- unmix pCE, mix pCE, global mix-invariance consistency,
+local connectivity consistency -- applies to 2D patches with no changes.
 
 Only sparse labels in ``labelsTr`` contribute to optimization. Dense training
 labels are accessed exclusively for model selection on a patient-level
-holdout, exactly as in ``train_pce_3d.py``.
+holdout, exactly as in ``train_pce_2d.py``. WORD stays a full-3D VNet
+pipeline, see ``train_cyclemix_3d.py``.
 """
 
 import argparse
@@ -21,9 +21,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader, Subset
 
@@ -32,53 +30,40 @@ REPO_ROOT = CODE_DIR.parent
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
-from dataloader.scribblebench_3d import (  # noqa: E402
-    DATASET_CONFIGS,
-    RandomGenerator3D,
-    ScribbleBench3DDataset,
-)
-from networks.vnet_3d import VNet3D  # noqa: E402
+from dataloader.scribblebench_2d import RandomGenerator2D, ScribbleBench2DDataset  # noqa: E402
+from dataloader.scribblebench_3d import DATASET_CONFIGS  # noqa: E402
+from networks.unet_2d import UNet2D  # noqa: E402
+from train.common_2d import validate_2d  # noqa: E402
 from train.common_3d import (  # noqa: E402
     atomic_torch_save,
     checkpoint_due,
-    make_published_split,
-    partial_cross_entropy,
     seed_everything,
     seed_worker,
-    validate,
 )
-from utils.cyclemix import (  # noqa: E402
-    largest_component_targets,
-    mix_images,
-    mix_labels,
-    negative_cosine_similarity,
-    occlude,
-    sample_batch_cuboid_masks,
-)
+from train.train_cyclemix_3d import cyclemix_step  # noqa: E402
+from train.train_pce_2d import build_val_dataset, resolve_case_split  # noqa: E402
 
-SUPPORTED_DATASETS = ("WORD",)
+SUPPORTED_DATASETS = ("ACDC", "MSCMR")
 DEFAULTS = {
-    # CycleMix mixes each sample with another one drawn from the same batch,
-    # so batch_size must be >= 2; the pCE baseline's WORD default of 1 cannot
-    # be reused here.
-    "WORD": {"patch_size": (64, 96, 96), "batch_size": 2},
+    "ACDC": {"patch_size": (256, 256), "batch_size": 24},
+    "MSCMR": {"patch_size": (256, 256), "batch_size": 24},
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a 3D VNet from ScribbleBench scribbles with CycleMix"
+        description="Train a 2D U-Net from ScribbleBench scribbles with CycleMix"
     )
     parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS)
     parser.add_argument("--root_path", default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--max_iterations", type=int, default=30000)
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--patch_size", nargs=3, type=int, default=None, metavar=("D", "H", "W"))
-    parser.add_argument("--n_filters", type=int, default=16, help="VNet base channel width")
+    parser.add_argument("--patch_size", nargs=2, type=int, default=None, metavar=("H", "W"))
+    parser.add_argument("--feature_channels", nargs="+", type=int, default=(16, 32, 64, 128, 256))
     parser.add_argument("--learning_rate", type=float, default=1e-2)
-    parser.add_argument("--momentum", type=float, default=0.99)
-    parser.add_argument("--weight_decay", type=float, default=3e-5)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument(
         "--early_interval", type=int, default=5000,
         help="eval+checkpoint cadence for iterations <= --late_phase_start",
@@ -91,25 +76,17 @@ def parse_args():
         "--late_phase_start", type=int, default=20000,
         help="iteration at which the finer --late_interval cadence begins",
     )
-    parser.add_argument("--val_overlap", type=float, default=0.5)
-    parser.add_argument("--sw_batch_size", type=int, default=1)
-    parser.add_argument("--max_accumulator_mb", type=int, default=1024)
-    parser.add_argument("--temp_dir", default=None)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--foreground_crop_prob", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", default=None)
 
-    # CycleMix loss weights (paper Eq. 14; the official code hard-codes 0.1
-    # for both consistency terms instead of the paper's reported 0.05/1.0 --
-    # we default to the paper's reported values).
+    # CycleMix loss weights (paper Eq. 14; matches train_cyclemix_3d.py).
     parser.add_argument("--lambda_unmix", type=float, default=1.0)
     parser.add_argument("--lambda_mix", type=float, default=1.0)
     parser.add_argument("--lambda_con_global", type=float, default=0.05)
     parser.add_argument("--lambda_con_local", type=float, default=1.0)
-    # Fraction of each patch axis covered by the mix box / occlusion box.
     parser.add_argument("--mix_frac_low", type=float, default=0.3)
     parser.add_argument("--mix_frac_high", type=float, default=0.7)
     parser.add_argument("--occlusion_frac_low", type=float, default=0.1)
@@ -121,32 +98,21 @@ def validate_args(args):
     defaults = DEFAULTS[args.dataset]
     args.patch_size = tuple(args.patch_size or defaults["patch_size"])
     args.batch_size = args.batch_size or defaults["batch_size"]
+    args.feature_channels = tuple(args.feature_channels)
     if args.batch_size < 2:
         raise ValueError("CycleMix pairs each sample with another one in the batch; batch_size must be >= 2")
     if args.max_iterations < 1:
         raise ValueError("max_iterations must be positive")
-    if args.n_filters < 1:
-        raise ValueError("n_filters must be positive")
+    if len(args.feature_channels) != 5 or any(value < 1 for value in args.feature_channels):
+        raise ValueError("feature_channels must contain five positive integers")
     if any(value < 1 for value in args.patch_size):
         raise ValueError("patch_size values must be positive")
-    # VNet3D downsamples D/H/W uniformly by 16 (4 stride-2 stages).
     if any(size % 16 for size in args.patch_size):
-        raise ValueError("patch_size must be divisible by 16 in DHW order")
-    bottleneck_shape = [size // 16 for size in args.patch_size]
-    if np.prod(bottleneck_shape) <= 1:
-        raise ValueError("patch_size produces a one-voxel bottleneck, which BatchNorm3d cannot use")
+        raise ValueError("patch_size must be divisible by 16")
     if args.early_interval < 1 or args.late_interval < 1 or args.num_workers < 0:
         raise ValueError("early_interval/late_interval must be positive and num_workers non-negative")
     if args.late_phase_start < 0:
         raise ValueError("late_phase_start must be non-negative")
-    if not 0 <= args.val_overlap < 1:
-        raise ValueError("val_overlap must satisfy 0 <= val_overlap < 1")
-    if not 0 <= args.foreground_crop_prob <= 1:
-        raise ValueError("foreground_crop_prob must satisfy 0 <= p <= 1")
-    if args.sw_batch_size < 1 or args.max_accumulator_mb < 0:
-        raise ValueError("invalid sliding-window settings")
-    if args.temp_dir is not None and not Path(args.temp_dir).is_dir():
-        raise ValueError("temp_dir does not exist: {}".format(args.temp_dir))
     for name in ("mix_frac_low", "mix_frac_high", "occlusion_frac_low", "occlusion_frac_high"):
         value = getattr(args, name)
         if not 0 < value <= 1:
@@ -158,90 +124,20 @@ def validate_args(args):
     return args
 
 
-def cyclemix_step(model, image, target, ignore_index, args, device):
-    """One CycleMix forward pass; returns the total loss and its components."""
-    batch_size = image.shape[0]
-    perm = (torch.arange(batch_size, device=device) + 1) % batch_size
-
-    logits = model(image)
-    loss_unmix, labeled_voxels = partial_cross_entropy(logits, target, ignore_index)
-    probs = F.softmax(logits, dim=1)
-    probs_partner = probs[perm]
-
-    mix_frac = (args.mix_frac_low, args.mix_frac_high)
-    occ_frac = (args.occlusion_frac_low, args.occlusion_frac_high)
-
-    # Direction A: M(x, x[perm]) then occlude.
-    mask_mix_a = sample_batch_cuboid_masks(batch_size, args.patch_size, mix_frac, device)
-    mask_occ_a = sample_batch_cuboid_masks(batch_size, args.patch_size, occ_frac, device)
-    image_mix_a = mix_images(image, image[perm], mask_mix_a)
-    label_mix_a = mix_labels(target, target[perm], mask_mix_a)
-    image_occ_a, label_occ_a = occlude(image_mix_a, label_mix_a, mask_occ_a, ignore_index)
-
-    # Direction B: M(x[perm], x) with an independently sampled pair of boxes,
-    # since the paper's mix operator is not symmetric.
-    mask_mix_b = sample_batch_cuboid_masks(batch_size, args.patch_size, mix_frac, device)
-    mask_occ_b = sample_batch_cuboid_masks(batch_size, args.patch_size, occ_frac, device)
-    image_mix_b = mix_images(image[perm], image, mask_mix_b)
-    label_mix_b = mix_labels(target[perm], target, mask_mix_b)
-    image_occ_b, label_occ_b = occlude(image_mix_b, label_mix_b, mask_occ_b, ignore_index)
-
-    logits_occ_a = model(image_occ_a)
-    logits_occ_b = model(image_occ_b)
-    loss_mix_a, _ = partial_cross_entropy(logits_occ_a, label_occ_a, ignore_index)
-    loss_mix_b, _ = partial_cross_entropy(logits_occ_b, label_occ_b, ignore_index)
-    loss_mix = 0.5 * (loss_mix_a + loss_mix_b)
-
-    # Global consistency: mixing the two original predictions and zeroing the
-    # occluded region should match segmenting the occluded-mixed image directly.
-    keep_a = (~mask_occ_a).to(probs.dtype)
-    keep_b = (~mask_occ_b).to(probs.dtype)
-    target_probs_a = mix_images(probs, probs_partner, mask_mix_a) * keep_a
-    target_probs_b = mix_images(probs_partner, probs, mask_mix_b) * keep_b
-    pred_probs_a = F.softmax(logits_occ_a, dim=1) * keep_a
-    pred_probs_b = F.softmax(logits_occ_b, dim=1) * keep_b
-    loss_con_global = 0.5 * (
-        negative_cosine_similarity(target_probs_a, pred_probs_a)
-        + negative_cosine_similarity(target_probs_b, pred_probs_b)
-    )
-
-    # Local consistency: predictions should collapse onto a single connected
-    # component per foreground class. Every batch element already plays both
-    # the "sample 1" and "sample 2" role once (via `perm`), so a single mean
-    # over the batch already realizes the paper's symmetric 0.5*(term+term).
-    cleaned_targets = largest_component_targets(probs)
-    loss_con_local = negative_cosine_similarity(probs, cleaned_targets)
-
-    total = (
-        args.lambda_unmix * loss_unmix
-        + args.lambda_mix * loss_mix
-        + args.lambda_con_global * loss_con_global
-        + args.lambda_con_local * loss_con_local
-    )
-    components = {
-        "unmix": loss_unmix.item(),
-        "mix": loss_mix.item(),
-        "con_global": loss_con_global.item(),
-        "con_local": loss_con_local.item(),
-        "labeled_voxels": labeled_voxels.item(),
-    }
-    return total, components
-
-
 def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
     return {
         "schema_version": 1,
-        "model_name": "vnet_3d",
+        "model_name": "unet_2d",
         "training_method": "cyclemix",
         "model_config": {
             "in_chns": 1,
             "class_num": len(DATASET_CONFIGS[args.dataset]["class_names"]),
-            "n_filters": args.n_filters,
+            "feature_chns": list(args.feature_channels),
         },
         "data_config": {
             "dataset": args.dataset,
             "root_path": str(args.root_path) if args.root_path else None,
-            "patch_size_dhw": list(args.patch_size),
+            "patch_size_hw": list(args.patch_size),
             "ignore_index": DATASET_CONFIGS[args.dataset]["ignore_index"],
         },
         "global_step": step,
@@ -258,8 +154,8 @@ def restore_checkpoint(path, model, optimizer, scaler, args, split):
     checkpoint = torch.load(path, map_location="cpu")
     expected_model = checkpoint.get("model_config", {})
     expected_data = checkpoint.get("data_config", {})
-    if expected_model.get("n_filters") != args.n_filters:
-        raise ValueError("resume checkpoint n_filters does not match")
+    if expected_model.get("feature_chns") != list(args.feature_channels):
+        raise ValueError("resume checkpoint feature_channels do not match")
     if expected_data.get("dataset") != args.dataset:
         raise ValueError("resume checkpoint dataset does not match")
     if checkpoint.get("split") != split:
@@ -296,30 +192,30 @@ def train(args):
         logging.warning("AMP requested on %s; disabling AMP", device)
         args.amp = False
 
-    train_transform = RandomGenerator3D(args.patch_size, foreground_prob=args.foreground_crop_prob)
-    train_dataset = ScribbleBench3DDataset(
+    train_transform = RandomGenerator2D(args.patch_size)
+    train_dataset = ScribbleBench2DDataset(
         args.dataset, base_dir=args.root_path, split="train", sup_type="scribble", transform=train_transform
     )
-    val_dataset = ScribbleBench3DDataset(
-        args.dataset, base_dir=args.root_path, split="train", sup_type="scribble", return_full_label=True
-    )
-    train_indices, val_indices, train_groups, val_groups, protocol = make_published_split(
-        train_dataset.samples, args.dataset
+    val_dataset = build_val_dataset(args)
+
+    train_case_indices, val_case_indices, train_groups, val_groups, protocol = resolve_case_split(
+        train_dataset.cases, args.dataset
     )
     split = {
         "protocol": protocol,
         "grouped_by_patient": True,
         "train_groups": train_groups,
         "val_groups": val_groups,
-        "train_cases": [train_dataset.samples[index]["case"] for index in train_indices],
-        "val_cases": [train_dataset.samples[index]["case"] for index in val_indices],
+        "train_cases": [train_dataset.cases[index] for index in train_case_indices],
+        "val_cases": [train_dataset.cases[index] for index in val_case_indices],
     }
     with (output_dir / "split.json").open("w", encoding="utf-8") as handle:
         json.dump(split, handle, indent=2)
 
+    train_slice_positions = train_dataset.slice_positions_for_volumes(train_case_indices)
     generator = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
-        Subset(train_dataset, train_indices),
+        Subset(train_dataset, train_slice_positions),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -330,11 +226,11 @@ def train(args):
         drop_last=True,  # CycleMix pairs samples in-batch; a size-1 final batch cannot pair.
     )
     if len(loader) == 0:
-        raise RuntimeError("training loader is empty (need at least 2 * batch_size training samples)")
+        raise RuntimeError("training loader is empty (need at least 2 * batch_size training slices)")
 
     num_classes = train_dataset.num_classes
     ignore_index = train_dataset.ignore_index
-    model = VNet3D(in_chns=1, class_num=num_classes, n_filters=args.n_filters).to(device)
+    model = UNet2D(in_chns=1, class_num=num_classes, feature_chns=args.feature_channels).to(device)
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.learning_rate, momentum=args.momentum, nesterov=True, weight_decay=args.weight_decay
     )
@@ -347,8 +243,9 @@ def train(args):
             raise ValueError("resume checkpoint already reached max_iterations; increase --max_iterations")
 
     logging.info(
-        "dataset=%s classes=%d ignore=%d train=%d val=%d patch=%s device=%s",
-        args.dataset, num_classes, ignore_index, len(train_indices), len(val_indices), args.patch_size, device,
+        "dataset=%s classes=%d ignore=%d train_slices=%d val_cases=%d patch=%s device=%s",
+        args.dataset, num_classes, ignore_index, len(train_slice_positions), len(val_case_indices),
+        args.patch_size, device,
     )
     writer = SummaryWriter(str(output_dir / "tensorboard"))
     metrics_path = output_dir / "validation.jsonl"
@@ -390,7 +287,7 @@ def train(args):
                     or step == args.max_iterations
                 )
                 if should_checkpoint:
-                    result = validate(model, val_dataset, val_indices, args, device, num_classes)
+                    result = validate_2d(model, val_dataset, val_case_indices, args, device, num_classes)
                     last_eval_step = step
                     score = result["mean_dice"]
                     if not math.isfinite(score):

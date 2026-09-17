@@ -1,8 +1,15 @@
-"""UNet3D + partial cross-entropy baseline with published legacy splits.
+"""VNet3D + partial cross-entropy baseline with published legacy splits, for
+WORD's full-3D protocol.
+
+WORD (near-isotropic abdominal CT) is the one dataset in this benchmark
+trained as full 3D volumes, with a VNet backbone -- the standard choice for
+this modality in the scribble-supervision/WORD literature. ACDC/MSCMR train
+as independent 2D slices instead; see ``train_pce_2d.py``.
 
 Only sparse labels in ``labelsTr`` contribute to optimization. Dense training
-labels are accessed exclusively for model selection on a patient-level holdout.
-The official ``imagesTs``/``labelsTs`` split is never opened by this script.
+labels are accessed exclusively for model selection on a patient-level
+holdout. The official ``imagesTs``/``labelsTs`` split is never opened by this
+script.
 """
 
 import argparse
@@ -34,23 +41,22 @@ from dataloader.scribblebench_3d import (  # noqa: E402
     RandomGenerator3D,
     ScribbleBench3DDataset,
 )
-from networks.unet_3d import UNet3D  # noqa: E402
+from networks.vnet_3d import VNet3D  # noqa: E402
 from utils.sliding_window_3d import sliding_window_predict  # noqa: E402
 from train.legacy_splits import published_groups  # noqa: E402
 
 
+SUPPORTED_DATASETS = ("WORD",)
 DEFAULTS = {
-    "ACDC": {"patch_size": (16, 128, 128), "batch_size": 2},
-    "MSCMR": {"patch_size": (16, 128, 128), "batch_size": 2},
     "WORD": {"patch_size": (64, 96, 96), "batch_size": 1},
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a 3D U-Net from ScribbleBench scribbles with pCE"
+        description="Train a 3D VNet from ScribbleBench scribbles with pCE"
     )
-    parser.add_argument("--dataset", required=True, choices=sorted(DATASET_CONFIGS))
+    parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS)
     parser.add_argument(
         "--root_path",
         default=None,
@@ -60,7 +66,7 @@ def parse_args():
     parser.add_argument("--max_iterations", type=int, default=30000)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--patch_size", nargs=3, type=int, default=None, metavar=("D", "H", "W"))
-    parser.add_argument("--feature_channels", nargs="+", type=int, default=(16, 32, 64, 128, 256))
+    parser.add_argument("--n_filters", type=int, default=16, help="VNet base channel width")
     parser.add_argument("--learning_rate", type=float, default=1e-2)
     parser.add_argument("--momentum", type=float, default=0.99)
     parser.add_argument("--weight_decay", type=float, default=3e-5)
@@ -93,22 +99,18 @@ def validate_args(args):
     defaults = DEFAULTS[args.dataset]
     args.patch_size = tuple(args.patch_size or defaults["patch_size"])
     args.batch_size = args.batch_size or defaults["batch_size"]
-    args.feature_channels = tuple(args.feature_channels)
     if args.max_iterations < 1 or args.batch_size < 1:
         raise ValueError("max_iterations and batch_size must be positive")
-    if len(args.feature_channels) != 5 or any(value < 1 for value in args.feature_channels):
-        raise ValueError("feature_channels must contain five positive integers")
+    if args.n_filters < 1:
+        raise ValueError("n_filters must be positive")
     if any(value < 1 for value in args.patch_size):
         raise ValueError("patch_size values must be positive")
-    # UNet3D downsamples D by 8 and H/W by 16 with its default strides.
-    divisors = (8, 16, 16)
-    if any(size % divisor for size, divisor in zip(args.patch_size, divisors)):
-        raise ValueError("patch_size must be divisible by (8, 16, 16) in DHW order")
-    bottleneck_shape = [
-        size // divisor for size, divisor in zip(args.patch_size, divisors)
-    ]
+    # VNet3D downsamples D/H/W uniformly by 16 (4 stride-2 stages).
+    if any(size % 16 for size in args.patch_size):
+        raise ValueError("patch_size must be divisible by 16 in DHW order")
+    bottleneck_shape = [size // 16 for size in args.patch_size]
     if np.prod(bottleneck_shape) <= 1:
-        raise ValueError("patch_size produces a one-voxel bottleneck, which InstanceNorm cannot use")
+        raise ValueError("patch_size produces a one-voxel bottleneck, which BatchNorm3d cannot use")
     if args.early_interval < 1 or args.late_interval < 1 or args.num_workers < 0:
         raise ValueError("early_interval/late_interval must be positive and num_workers non-negative")
     if args.late_phase_start < 0:
@@ -271,11 +273,11 @@ def atomic_torch_save(payload, path):
 def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
     return {
         "schema_version": 1,
-        "model_name": "unet_3d",
+        "model_name": "vnet_3d",
         "model_config": {
             "in_chns": 1,
             "class_num": len(DATASET_CONFIGS[args.dataset]["class_names"]),
-            "feature_chns": list(args.feature_channels),
+            "n_filters": args.n_filters,
         },
         "data_config": {
             "dataset": args.dataset,
@@ -297,8 +299,8 @@ def restore_checkpoint(path, model, optimizer, scaler, args, split):
     checkpoint = torch.load(path, map_location="cpu")
     expected_model = checkpoint.get("model_config", {})
     expected_data = checkpoint.get("data_config", {})
-    if expected_model.get("feature_chns") != list(args.feature_channels):
-        raise ValueError("resume checkpoint feature_channels do not match")
+    if expected_model.get("n_filters") != args.n_filters:
+        raise ValueError("resume checkpoint n_filters does not match")
     if expected_data.get("dataset") != args.dataset:
         raise ValueError("resume checkpoint dataset does not match")
     if checkpoint.get("split") != split:
@@ -387,10 +389,10 @@ def train(args):
 
     num_classes = train_dataset.num_classes
     ignore_index = train_dataset.ignore_index
-    model = UNet3D(
+    model = VNet3D(
         in_chns=1,
         class_num=num_classes,
-        feature_chns=args.feature_channels,
+        n_filters=args.n_filters,
     ).to(device)
     optimizer = torch.optim.SGD(
         model.parameters(),

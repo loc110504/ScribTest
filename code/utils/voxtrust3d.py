@@ -67,38 +67,57 @@ def assign_scribble_blocks(label, num_classes):
     isolates distinct strokes that happen to share a slice, matching "for a
     true 3D stroke, a connected stroke component is used".
 
+    ACDC/MSCMR train as independent 2D slices (anisotropic spacing), not full
+    3D volumes; since a block is already defined at single-slice granularity,
+    the 2D pipeline's "volume" for this partition/calibration machinery is
+    simply one slice, and a ``(H, W)`` ``label`` is accepted directly -- one
+    plane, no D-slice loop, coordinates are ``(h, w)`` instead of ``(d, h, w)``.
+
     Background (class 0) is included: in this repo's scribble convention it
     is an explicit, sparse annotation (distinct from ``ignore_index``), so it
     is real supervision just like any foreground class and participates in
     the same partition/calibration machinery.
 
     Args:
-        label: ``(D, H, W)`` integer array; ``ignore_index`` marks unlabeled
-            voxels and must already be excluded by the caller (any value
-            equal to a real class id in ``[0, num_classes)`` is treated as
-            that class's scribble).
+        label: ``(D, H, W)`` (3D volume) or ``(H, W)`` (single 2D slice)
+            integer array; ``ignore_index`` marks unlabeled voxels and must
+            already be excluded by the caller (any value equal to a real
+            class id in ``[0, num_classes)`` is treated as that class's
+            scribble).
     Returns:
-        dict: ``class_id -> list of int64 (N_k, 3) voxel-coordinate arrays``,
-        one entry per block. Classes with no scribble voxels map to ``[]``.
+        dict: ``class_id -> list of int64 (N_k, 3 or 2) voxel-coordinate
+        arrays``, one entry per block. Classes with no scribble voxels map
+        to ``[]``.
     """
-    if label.ndim != 3:
-        raise ValueError("label must be a (D, H, W) array, got shape {}".format(label.shape))
     structure = np.ones((3, 3), dtype=bool)
     blocks = {}
-    for class_id in range(num_classes):
-        class_blocks = []
-        class_mask = label == class_id
-        depth_indices = np.flatnonzero(class_mask.any(axis=(1, 2)))
-        for d in depth_indices:
-            plane = class_mask[d]
-            component_labels, n_components = ndimage.label(plane, structure=structure)
+    if label.ndim == 3:
+        for class_id in range(num_classes):
+            class_blocks = []
+            class_mask = label == class_id
+            depth_indices = np.flatnonzero(class_mask.any(axis=(1, 2)))
+            for d in depth_indices:
+                plane = class_mask[d]
+                component_labels, n_components = ndimage.label(plane, structure=structure)
+                for component_id in range(1, n_components + 1):
+                    h_idx, w_idx = np.nonzero(component_labels == component_id)
+                    d_idx = np.full_like(h_idx, d)
+                    coords = np.stack([d_idx, h_idx, w_idx], axis=1).astype(np.int64)
+                    class_blocks.append(coords)
+            blocks[class_id] = class_blocks
+        return blocks
+    if label.ndim == 2:
+        for class_id in range(num_classes):
+            class_blocks = []
+            class_mask = label == class_id
+            component_labels, n_components = ndimage.label(class_mask, structure=structure)
             for component_id in range(1, n_components + 1):
                 h_idx, w_idx = np.nonzero(component_labels == component_id)
-                d_idx = np.full_like(h_idx, d)
-                coords = np.stack([d_idx, h_idx, w_idx], axis=1).astype(np.int64)
+                coords = np.stack([h_idx, w_idx], axis=1).astype(np.int64)
                 class_blocks.append(coords)
-        blocks[class_id] = class_blocks
-    return blocks
+            blocks[class_id] = class_blocks
+        return blocks
+    raise ValueError("label must be a (D, H, W) or (H, W) array, got shape {}".format(label.shape))
 
 
 def spatially_blocked_partition(label, ignore_index, num_classes, holdout_fraction, rng):
@@ -110,11 +129,12 @@ def spatially_blocked_partition(label, ignore_index, num_classes, holdout_fracti
     scribble block in a volume, that block remains in Omega_sup", Sec. 5).
 
     Args:
-        label: ``(D, H, W)`` integer scribble array (``ignore_index`` = unlabeled).
+        label: ``(D, H, W)`` (3D volume) or ``(H, W)`` (single 2D slice)
+            integer scribble array (``ignore_index`` = unlabeled).
         rng: a ``numpy.random.Generator``; caller controls determinism (see
             ``stable_seed``) so the partition is fixed for an entire run.
     Returns:
-        sup_coords, cal_coords: ``{class_id: (N, 3) int64 array}``.
+        sup_coords, cal_coords: ``{class_id: (N, label.ndim) int64 array}``.
         cal_block_id: ``{class_id: (N,) int64 array}``, the index (within
             that class's block list) each ``cal_coords`` voxel came from --
             used later to cap how many voxels from one block/stroke can
@@ -129,7 +149,7 @@ def spatially_blocked_partition(label, ignore_index, num_classes, holdout_fracti
     sup_coords, cal_coords, cal_block_id = {}, {}, {}
     for class_id, blocks in blocks_by_class.items():
         n_blocks = len(blocks)
-        empty_coords = np.zeros((0, 3), dtype=np.int64)
+        empty_coords = np.zeros((0, label.ndim), dtype=np.int64)
         if n_blocks == 0:
             sup_coords[class_id] = empty_coords
             cal_coords[class_id] = empty_coords
@@ -168,10 +188,15 @@ def spatially_blocked_partition(label, ignore_index, num_classes, holdout_fracti
 
 
 def build_class_trees(sup_coords, spacing):
-    """``{class_id: scipy.spatial.cKDTree}`` over Omega_sup, in physical mm."""
+    """``{class_id: scipy.spatial.cKDTree}`` over Omega_sup, in physical mm.
+
+    ``spacing`` has 3 entries ``(D, H, W)`` for a 3D volume or 2 entries
+    ``(H, W)`` for a single 2D ACDC/MSCMR slice, matching ``sup_coords``'
+    coordinate rank.
+    """
     spacing = np.asarray(spacing, dtype=np.float64)
-    if spacing.shape != (3,):
-        raise ValueError("spacing must have 3 entries (D, H, W), got {}".format(spacing.shape))
+    if spacing.ndim != 1 or spacing.shape[0] not in (2, 3):
+        raise ValueError("spacing must have 2 entries (H, W) or 3 entries (D, H, W), got {}".format(spacing.shape))
     trees = {}
     for class_id, coords in sup_coords.items():
         if len(coords) == 0:
@@ -187,16 +212,18 @@ def query_transfer_distance(trees, class_ids, points_voxel, spacing):
     Args:
         trees: ``{class_id: cKDTree}`` for one volume (see ``build_class_trees``).
         class_ids: ``(N,)`` int array, the class each point queries against.
-        points_voxel: ``(N, 3)`` int/float array of voxel coordinates.
-        spacing: ``(3,)`` physical spacing, same convention as ``build_class_trees``.
+        points_voxel: ``(N, 3)`` (3D) or ``(N, 2)`` (2D) int/float array of
+            voxel coordinates.
+        spacing: ``(3,)`` or ``(2,)`` physical spacing, same convention and
+            rank as ``build_class_trees``.
     Returns:
         ``(N,)`` float64 array; ``NaN`` where ``trees`` has no entry for that
         point's class (i.e. that class has no Omega_sup voxel in this volume).
     """
     class_ids = np.asarray(class_ids)
     points_voxel = np.asarray(points_voxel)
-    if points_voxel.ndim != 2 or points_voxel.shape[1] != 3:
-        raise ValueError("points_voxel must have shape (N, 3)")
+    if points_voxel.ndim != 2 or points_voxel.shape[1] not in (2, 3):
+        raise ValueError("points_voxel must have shape (N, 2) or (N, 3)")
     if len(class_ids) != len(points_voxel):
         raise ValueError("class_ids and points_voxel must have matching length")
     spacing = np.asarray(spacing, dtype=np.float64)
@@ -218,18 +245,28 @@ def query_transfer_distance(trees, class_ids, points_voxel, spacing):
 def batch_transfer_distance(predicted_class, coord, valid, case_trees, spacing):
     """Batched Eq. 8 lookup for a training patch.
 
+    Shape-agnostic over the spatial rank: works identically for 3D volume
+    patches (``D, H, W``) and 2D ACDC/MSCMR slices (``H, W``), since it only
+    ever indexes by boolean mask and transposes the leading coordinate-
+    channel axis -- whichever rank ``coord``/``spacing`` carry flows straight
+    through to :func:`query_transfer_distance`.
+
     Args:
-        predicted_class: ``(B, D, H, W)`` int array, e.g. the teacher's argmax.
-        coord: ``(B, 3, D, H, W)`` int array of original-volume voxel
-            coordinates (see ``pad_crop_flip_rotate``'s ``coord_d/h/w``
-            convention); a voxel is padding/invalid wherever any channel < 0.
-        valid: ``(B, D, H, W)`` bool array, voxels to actually query (e.g. the
-            union of Omega_cal and Omega_u candidates in the patch) --
-            skipping the rest keeps this fast even for large patches.
+        predicted_class: ``(B, D, H, W)`` or ``(B, H, W)`` int array, e.g. the
+            teacher's argmax.
+        coord: ``(B, 3, D, H, W)`` or ``(B, 2, H, W)`` int array of original-
+            volume/slice voxel coordinates (see ``build_patch_coordinates``'s
+            ``coord_d/h/w`` convention for the 3D case); a voxel is padding/
+            invalid wherever any channel < 0.
+        valid: ``(B, D, H, W)`` or ``(B, H, W)`` bool array, voxels to
+            actually query (e.g. the union of Omega_cal and Omega_u
+            candidates in the patch) -- skipping the rest keeps this fast
+            even for large patches.
         case_trees: length-``B`` list of ``{class_id: cKDTree}``.
-        spacing: ``(B, 3)`` array, one spacing per sample.
+        spacing: ``(B, 3)`` or ``(B, 2)`` array, one spacing per sample.
     Returns:
-        ``(B, D, H, W)`` float32 array; ``NaN`` where not requested or undefined.
+        Float32 array shaped like ``predicted_class``; ``NaN`` where not
+        requested or undefined.
     """
     batch_size = predicted_class.shape[0]
     if len(case_trees) != batch_size or spacing.shape[0] != batch_size:
@@ -309,13 +346,18 @@ def reliability_score(student_prob, teacher_prob, eps=1e-6):
     semantic margin (top1 vs. top2 class probability) and the student-teacher
     Jensen-Shannon stability. There is no separate confidence/entropy term.
 
+    Elementwise over the class dimension only, so this is shape-agnostic:
+    also used as-is for ACDC/MSCMR's ``[B, C, H, W]`` 2D slice pipeline.
+
     Args:
-        student_prob, teacher_prob: ``[B, C, D, H, W]`` softmax probabilities,
-            ``C >= 2``, pixel-aligned (same spatial transform, only the
-            student's input received extra intensity perturbation).
+        student_prob, teacher_prob: ``[B, C, D, H, W]`` (3D) or ``[B, C, H, W]``
+            (2D) softmax probabilities, ``C >= 2``, pixel-aligned (same
+            spatial transform, only the student's input received extra
+            intensity perturbation).
     Returns:
-        dict of ``[B, D, H, W]`` tensors: ``score`` (R_i, Eq. 7), ``teacher_pred``
-        (ĉ_i, long), ``teacher_conf``, ``margin`` (M_i, Eq. 5), ``stability`` (S_i, Eq. 6).
+        dict of tensors shaped like ``student_prob`` minus the class dim:
+        ``score`` (R_i, Eq. 7), ``teacher_pred`` (ĉ_i, long), ``teacher_conf``,
+        ``margin`` (M_i, Eq. 5), ``stability`` (S_i, Eq. 6).
     """
     if student_prob.shape != teacher_prob.shape:
         raise ValueError(
@@ -538,17 +580,26 @@ def build_pseudo_targets(
     ``d_max`` was never observed at all) fall back to the class-only
     threshold; if that is also unavailable (``inf``), the voxel is rejected.
 
+    Shape-agnostic over the spatial rank (indexing/elementwise only), so this
+    is used as-is for both the 3D volume patches below and ACDC/MSCMR's 2D
+    slice pipeline.
+
     Args:
-        teacher_prob: ``[B, C, D, H, W]`` softmax teacher probabilities.
-        omega_u: ``[B, D, H, W]`` bool, real (non-padding) unlabeled candidates.
-        distance: ``[B, D, H, W]`` float, ``D_{ĉi}(i)``; ``NaN`` if undefined.
-        teacher_pred, reliability: ``[B, D, H, W]``, from ``reliability_score``.
+        teacher_prob: ``[B, C, D, H, W]`` or ``[B, C, H, W]`` softmax teacher
+            probabilities.
+        omega_u: real (non-padding) unlabeled candidates, spatial-rank-matched
+            bool tensor.
+        distance: ``D_{ĉi}(i)`` float tensor, spatial-rank-matched; ``NaN`` if
+            undefined.
+        teacher_pred, reliability: spatial-rank-matched tensors, from
+            ``reliability_score``.
         stratum_edges: ``[C, B-1]`` tensor (see ``fit_distance_bins``).
         thresholds_table: ``[C, B]`` tensor, τ_{c,b} (``inf`` = abstain).
         class_only_thresholds, d_max: ``[C]`` tensors.
     Returns:
-        dict with ``target`` (``[B, C, D, H, W]``, detached ``sg(q_i)``),
-        ``mask`` (``[B, 1, D, H, W]``, detached ``A_i``), and diagnostics.
+        dict with ``target`` (shaped like ``teacher_prob``, detached
+        ``sg(q_i)``), ``mask`` (``teacher_prob`` with the class dim replaced
+        by a singleton, detached ``A_i``), and diagnostics.
     """
     if stratum_edges.shape[0] != thresholds_table.shape[0]:
         raise ValueError("stratum_edges/thresholds_table class dimension mismatch")
@@ -682,6 +733,69 @@ def strong_intensity_augment_3d(image, args):
     if args.strong_blur_prob > 0 and random.random() < args.strong_blur_prob:
         sigma = random.uniform(args.strong_blur_sigma_min, args.strong_blur_sigma_max)
         x = _gaussian_blur_3d(x, sigma)
+
+    return x
+
+
+def _gaussian_blur_2d(x, sigma):
+    """Separable 2D Gaussian blur, one shared sigma for the whole batch."""
+    for axis in (2, 3):
+        size = x.shape[axis]
+        radius = min(max(1, int(round(3.0 * sigma))), max(size - 1, 1))
+        coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=x.device)
+        kernel = torch.exp(-(coords**2) / (2.0 * sigma**2))
+        kernel = kernel / kernel.sum()
+        kernel_shape = [1, 1, 1, 1]
+        kernel_shape[axis] = kernel.numel()
+        kernel = kernel.view(kernel_shape)
+        pad_pair = 3 - axis  # axis 3(W)->pair 0, 2(H)->pair 1
+        pad = [0, 0, 0, 0]
+        pad[2 * pad_pair] = radius
+        pad[2 * pad_pair + 1] = radius
+        x = F.pad(x, pad, mode="reflect")
+        x = F.conv2d(x, kernel)
+    return x
+
+
+def strong_intensity_augment_2d(image, args):
+    """2D counterpart of :func:`strong_intensity_augment_3d`, for the
+    ACDC/MSCMR slice pipeline. Identical perturbations and per-sample
+    independent Bernoulli gating; only the tensor rank and the shared-blur
+    convolution differ (``conv2d`` over ``[B, C, H, W]`` instead of
+    ``conv3d`` over ``[B, C, D, H, W]``).
+    """
+    x = image
+    batch_size = x.shape[0]
+    device = x.device
+    dims = (1, 2, 3)
+    shape = (batch_size, 1, 1, 1)
+
+    brightness = _sample_uniform(1.0 - args.strong_brightness, 1.0 + args.strong_brightness, shape, device)
+    brightness = _bernoulli_gate(args.strong_brightness_prob, shape, device, brightness, 1.0)
+    contrast = _sample_uniform(1.0 - args.strong_contrast, 1.0 + args.strong_contrast, shape, device)
+    contrast = _bernoulli_gate(args.strong_contrast_prob, shape, device, contrast, 1.0)
+
+    mean = x.mean(dim=dims, keepdim=True)
+    x = (x - mean) * contrast + mean * brightness
+
+    if args.strong_gamma > 0 and args.strong_gamma_prob > 0:
+        gamma = _sample_uniform(1.0 - args.strong_gamma, 1.0 + args.strong_gamma, shape, device)
+        gamma = _bernoulli_gate(args.strong_gamma_prob, shape, device, gamma, 1.0)
+        x_min = x.amin(dim=dims, keepdim=True)
+        x_max = x.amax(dim=dims, keepdim=True)
+        x_range = (x_max - x_min).clamp_min(1e-5)
+        x_norm = ((x - x_min) / x_range).clamp(0.0, 1.0).pow(gamma)
+        x = x_norm * x_range + x_min
+
+    if args.strong_noise_std > 0 and args.strong_noise_prob > 0:
+        std = x.std(dim=dims, keepdim=True)
+        noise_scale = _sample_uniform(0.0, args.strong_noise_std, shape, device)
+        noise_scale = _bernoulli_gate(args.strong_noise_prob, shape, device, noise_scale, 0.0)
+        x = x + torch.randn_like(x) * std * noise_scale
+
+    if args.strong_blur_prob > 0 and random.random() < args.strong_blur_prob:
+        sigma = random.uniform(args.strong_blur_sigma_min, args.strong_blur_sigma_max)
+        x = _gaussian_blur_2d(x, sigma)
 
     return x
 
@@ -825,3 +939,45 @@ def random_flip_rotate(arrays):
         k = random.choice(choices)
         arrays = {key: np.rot90(value, k=k, axes=(1, 2)) for key, value in arrays.items()}
     return {key: np.ascontiguousarray(value) for key, value in arrays.items()}
+
+
+def random_flip_rotate_resize_2d(arrays, cval, output_size):
+    """2D counterpart of :func:`random_flip_rotate` for the ACDC/MSCMR slice
+    pipeline.
+
+    3D training crops a fixed-size patch out of a much larger volume (see
+    ``choose_patch_origin``/``build_patch_coordinates``/``gather_patch``),
+    so out-of-bounds padding is a real concern there. 2D ACDC/MSCMR slices
+    are already small, so training uses the *whole* native slice resized to
+    ``output_size`` -- there is no crop, no padding, and every array in
+    ``arrays`` (including coordinate channels) starts fully valid. This
+    function therefore also performs the resize step (nearest-neighbor,
+    matching ``dataloader.scribblebench_2d.RandomGenerator2D``, whose exact
+    augmentation policy it mirrors: 50% rot90+flip, else 25% random rotate
+    +-20 degrees, else identity), and takes an explicit per-key fill value
+    for the corners the rotate branch introduces (label-like channels want
+    their own ignore/background sentinel; the image wants 0; coordinate
+    channels want -1, matching ``build_patch_coordinates``'s padding
+    sentinel convention, even though nothing here is actually padding).
+
+    Args:
+        arrays: ``{key: (H, W) array}``, all the same native shape.
+        cval: ``{key: fill value}`` for every key in ``arrays``, used only by
+            the rotate branch.
+        output_size: ``(H, W)`` resize target.
+    Returns:
+        ``{key: (H, W) array}`` at ``output_size`` resolution.
+    """
+    if random.random() > 0.5:
+        k = random.randint(0, 3)
+        axis = random.randint(0, 1)
+        arrays = {key: np.flip(np.rot90(value, k), axis=axis).copy() for key, value in arrays.items()}
+    elif random.random() > 0.5:
+        angle = random.randint(-20, 19)
+        arrays = {
+            key: ndimage.rotate(value, angle, order=0, reshape=False, mode="constant", cval=cval[key])
+            for key, value in arrays.items()
+        }
+    height, width = next(iter(arrays.values())).shape
+    scale = (output_size[0] / height, output_size[1] / width)
+    return {key: np.ascontiguousarray(ndimage.zoom(value, scale, order=0)) for key, value in arrays.items()}

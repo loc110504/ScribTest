@@ -11,6 +11,7 @@ CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
+from networks.unet_2d import UNet2D
 from networks.unet_3d import UNet3D
 from train.train_sdtnet_3d import sdtnet_step
 from utils.sdtnet import TeacherEMA, feature_consistency_loss, pick_reliable_pixels, soft_dice_loss
@@ -103,6 +104,19 @@ class SoftDiceLossTests(unittest.TestCase):
         loss = soft_dice_loss(probs, target, num_classes=3, ignore_index=3)
         self.assertTrue(torch.isfinite(loss))
 
+    def test_2d_perfect_prediction_gives_near_zero_loss(self):
+        # Same scenario as the 3D case, one spatial rank down: probs/target
+        # are [B,C,H,W]/[B,H,W], the ACDC/MSCMR 2D slice pipeline's shape.
+        target = torch.zeros(2, 4, 4, dtype=torch.long)
+        target[:, 0:2, 0:2] = 1
+        probs = F.one_hot(target, num_classes=3).permute(0, 3, 1, 2).float()
+        loss = soft_dice_loss(probs, target, num_classes=3, ignore_index=3)
+        self.assertLess(loss.item(), 1e-3)
+
+    def test_rejects_unsupported_rank(self):
+        with self.assertRaises(ValueError):
+            soft_dice_loss(torch.rand(1, 3, 4), torch.zeros(1, 4, dtype=torch.long), 3, 3)
+
 
 class TeacherEMATests(unittest.TestCase):
     def test_step_moves_teacher_toward_student_and_decays_student(self):
@@ -149,6 +163,31 @@ class SDTNetStepTests(unittest.TestCase):
         self.assertGreater(student_grad_norm, 0.0)
         for teacher in (teacher1, teacher2):
             self.assertTrue(all(p.grad is None for p in teacher.parameters()))
+
+    def test_2d_step_produces_finite_loss_and_gradients(self):
+        # sdtnet_step reused verbatim by train_sdtnet_2d.py: same function,
+        # UNet2D models (now supporting return_features=True) and 2D tensors.
+        torch.manual_seed(2)
+
+        class Args:
+            confidence_threshold = 0.5
+
+        student = UNet2D(in_chns=1, class_num=4, feature_chns=(4, 8, 16, 24, 32))
+        teacher1 = UNet2D(in_chns=1, class_num=4, feature_chns=(4, 8, 16, 24, 32))
+        teacher2 = UNet2D(in_chns=1, class_num=4, feature_chns=(4, 8, 16, 24, 32))
+        image = torch.randn(2, 1, 32, 32)
+        target = torch.randint(0, 4, (2, 32, 32))
+        target[:, 0, 0] = 4
+
+        loss, selected, components = sdtnet_step(
+            student, teacher1, teacher2, image, target, ignore_index=4, num_classes=4, args=Args()
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn(selected, (1, 2))
+
+        loss.backward()
+        student_grad_norm = sum(p.grad.abs().sum().item() for p in student.parameters() if p.grad is not None)
+        self.assertGreater(student_grad_norm, 0.0)
 
 
 if __name__ == "__main__":

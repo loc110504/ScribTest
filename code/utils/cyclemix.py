@@ -17,7 +17,16 @@ import numpy as np
 import torch
 from scipy.ndimage import label as connected_components
 
+_STRUCTURE_8 = np.ones((3, 3), dtype=np.int8)
 _STRUCTURE_26 = np.ones((3, 3, 3), dtype=np.int8)
+
+
+def _connectivity_structure(spatial_ndim):
+    if spatial_ndim == 2:
+        return _STRUCTURE_8
+    if spatial_ndim == 3:
+        return _STRUCTURE_26
+    raise ValueError("Unsupported spatial rank: {}".format(spatial_ndim))
 
 
 def sample_cuboid_mask(patch_size, frac_range, rng=None):
@@ -77,12 +86,23 @@ def negative_cosine_similarity(p, q, dim=1, eps=1e-8):
 def largest_component_targets(probs):
     """Keep the largest connected component per foreground class (Eq. 13 ``C(.)``).
 
-    ``probs`` is a softmax probability map ``[B, C, D, H, W]``. Returns a
-    detached one-hot tensor of the same shape where, for every sample and
-    every foreground class, only the single largest 26-connected component of
-    the class's ``argmax`` mask survives; everything else (including smaller
-    components of the same class) is reassigned to background.
+    ``probs`` is a softmax probability map, either 3D ``[B, C, D, H, W]``
+    (26-connectivity) or 2D ``[B, C, H, W]`` (8-connectivity) -- the ACDC/
+    MSCMR 2D slice pipeline reuses this exact function, dispatched on
+    ``probs.ndim``. Returns a detached one-hot tensor of the same shape
+    where, for every sample and every foreground class, only the single
+    largest connected component of the class's ``argmax`` mask survives;
+    everything else (including smaller components of the same class) is
+    reassigned to background.
     """
+    if probs.ndim not in (4, 5):
+        raise ValueError(
+            "largest_component_targets expects [B,C,H,W] or [B,C,D,H,W], got ndim={}".format(
+                probs.ndim
+            )
+        )
+    spatial_ndim = probs.ndim - 2
+    structure = _connectivity_structure(spatial_ndim)
     batch_size, num_classes = probs.shape[0], probs.shape[1]
     argmax = probs.detach().argmax(dim=1).cpu().numpy()
     cleaned = np.zeros_like(argmax)
@@ -91,7 +111,7 @@ def largest_component_targets(probs):
             class_mask = argmax[b] == class_id
             if not class_mask.any():
                 continue
-            labeled, num_components = connected_components(class_mask, structure=_STRUCTURE_26)
+            labeled, num_components = connected_components(class_mask, structure=structure)
             if num_components == 0:
                 continue
             sizes = np.bincount(labeled.ravel())
@@ -100,5 +120,6 @@ def largest_component_targets(probs):
             cleaned[b][labeled == largest] = class_id
     cleaned_t = torch.from_numpy(cleaned).to(probs.device)
     one_hot = torch.nn.functional.one_hot(cleaned_t.long(), num_classes=num_classes)
-    one_hot = one_hot.permute(0, 4, 1, 2, 3).contiguous().to(probs.dtype)
+    permute_order = (0, spatial_ndim + 1) + tuple(range(1, spatial_ndim + 1))
+    one_hot = one_hot.permute(*permute_order).contiguous().to(probs.dtype)
     return one_hot

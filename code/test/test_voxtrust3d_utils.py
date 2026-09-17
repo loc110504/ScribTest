@@ -2,6 +2,7 @@
 
 import math
 import os
+import random
 import sys
 import unittest
 
@@ -25,10 +26,12 @@ from utils.voxtrust3d import (
     masked_soft_ce_loss,
     query_transfer_distance,
     random_flip_rotate,
+    random_flip_rotate_resize_2d,
     reliability_score,
     scatter_points_into_patch,
     spatially_blocked_partition,
     stable_seed,
+    strong_intensity_augment_2d,
     strong_intensity_augment_3d,
     wilson_lower_bound,
 )
@@ -62,6 +65,22 @@ class AssignScribbleBlocksTests(unittest.TestCase):
         label = np.zeros((2, 4, 4), dtype=np.int64)
         blocks = assign_scribble_blocks(label, num_classes=3)
         self.assertEqual(blocks[2], [])
+
+    def test_2d_single_slice_two_disjoint_components_are_separate_blocks(self):
+        # A (H, W) label -- one ACDC/MSCMR training slice -- is the 2D
+        # pipeline's "volume" for this same block-assignment function.
+        label = np.zeros((10, 10), dtype=np.int64)
+        label[0:2, 0:2] = 1
+        label[8:10, 8:10] = 1
+        blocks = assign_scribble_blocks(label, num_classes=2)
+        self.assertEqual(len(blocks[1]), 2)
+        sizes = sorted(len(block) for block in blocks[1])
+        self.assertEqual(sizes, [4, 4])
+        self.assertEqual(blocks[1][0].shape[1], 2)  # (h, w) coords, not (d, h, w)
+
+    def test_rejects_unsupported_rank(self):
+        with self.assertRaisesRegex(ValueError, "must be"):
+            assign_scribble_blocks(np.zeros((2, 2, 2, 2)), num_classes=2)
 
 
 class SpatiallyBlockedPartitionTests(unittest.TestCase):
@@ -105,6 +124,24 @@ class SpatiallyBlockedPartitionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             spatially_blocked_partition(label, 2, 2, 1.0, np.random.default_rng(0))
 
+    def test_2d_label_produces_two_column_coordinates(self):
+        # One ACDC/MSCMR slice: 10 disjoint single-voxel class-1 blocks,
+        # spaced 3 columns apart so none are 8-connected to a neighbor.
+        label = np.full((1, 30), 2, dtype=np.int64)
+        for i in range(10):
+            label[0, i * 3] = 1
+        rng = np.random.default_rng(0)
+        sup, cal, cal_block = spatially_blocked_partition(
+            label, ignore_index=2, num_classes=2, holdout_fraction=0.3, rng=rng
+        )
+        self.assertEqual(sup[1].shape[1], 2)
+        self.assertEqual(cal[1].shape[1], 2)
+        sup_set = {tuple(row) for row in sup[1]}
+        cal_set = {tuple(row) for row in cal[1]}
+        self.assertEqual(sup_set & cal_set, set())
+        expected = {tuple(row) for row in np.argwhere(label == 1)}
+        self.assertEqual(sup_set | cal_set, expected)
+
 
 class TransferDistanceTests(unittest.TestCase):
     def test_matches_brute_force_with_anisotropic_spacing(self):
@@ -126,6 +163,23 @@ class TransferDistanceTests(unittest.TestCase):
         trees = build_class_trees({0: np.zeros((0, 3), dtype=np.int64)}, np.ones(3))
         distance = query_transfer_distance(trees, np.array([0]), np.array([[1, 1, 1]]), np.ones(3))
         self.assertTrue(np.isnan(distance[0]))
+
+    def test_2d_matches_brute_force_with_anisotropic_spacing(self):
+        # Same scenario, one spatial rank down: (H, W) coordinates and a
+        # 2-entry spacing, the ACDC/MSCMR 2D slice pipeline's shape.
+        rng = np.random.default_rng(1)
+        sup_points = rng.integers(0, 20, size=(15, 2))
+        spacing = np.array([1.5, 1.0])
+        trees = build_class_trees({0: sup_points}, spacing)
+
+        query_points = rng.integers(0, 20, size=(8, 2))
+        class_ids = np.zeros(8, dtype=np.int64)
+        distance = query_transfer_distance(trees, class_ids, query_points, spacing)
+
+        physical_sup = sup_points * spacing[None, :]
+        physical_query = query_points * spacing[None, :]
+        expected = np.array([np.min(np.linalg.norm(physical_sup - q, axis=1)) for q in physical_query])
+        np.testing.assert_allclose(distance, expected, atol=1e-6)
 
     def test_batch_transfer_distance_only_touches_valid_voxels(self):
         sup_points = {0: np.array([[0, 0, 0]])}
@@ -408,6 +462,29 @@ class StrongIntensityAugment3DTests(unittest.TestCase):
         torch.testing.assert_close(augmented, image)
 
 
+class StrongIntensityAugment2DTests(unittest.TestCase):
+    Args = StrongIntensityAugment3DTests.Args
+
+    def test_preserves_shape_and_changes_the_image(self):
+        torch.manual_seed(0)
+        image = torch.rand(2, 1, 8, 8)
+        augmented = strong_intensity_augment_2d(image, self.Args())
+        self.assertEqual(augmented.shape, image.shape)
+        self.assertFalse(torch.allclose(augmented, image))
+
+    def test_all_probabilities_zero_is_near_identity(self):
+        class NoAugArgs(self.Args):
+            strong_brightness_prob = 0.0
+            strong_contrast_prob = 0.0
+            strong_gamma_prob = 0.0
+            strong_noise_prob = 0.0
+            strong_blur_prob = 0.0
+
+        image = torch.rand(1, 1, 8, 8)
+        augmented = strong_intensity_augment_2d(image, NoAugArgs())
+        torch.testing.assert_close(augmented, image)
+
+
 class ChoosePatchOriginTests(unittest.TestCase):
     def test_no_padding_needed_origin_in_valid_range(self):
         for _ in range(50):
@@ -493,6 +570,43 @@ class RandomFlipRotateTests(unittest.TestCase):
         self.assertEqual(len(marked), 1)
         d, h, w = marked[0]
         self.assertEqual(out["image"][d, h, w], image[2, 3, 1])
+
+
+class RandomFlipRotateResize2DTests(unittest.TestCase):
+    def test_resizes_every_key_to_output_size(self):
+        random_state = random.getstate()
+        random.seed(0)
+        try:
+            image = np.random.default_rng(0).random((12, 16)).astype(np.float32)
+            label = np.zeros((12, 16), dtype=np.int64)
+            coord_h, coord_w = np.indices((12, 16))
+            arrays = {"image": image, "label": label, "coord_h": coord_h, "coord_w": coord_w}
+            cval = {"image": 0.0, "label": 4, "coord_h": -1, "coord_w": -1}
+            for _ in range(10):
+                out = random_flip_rotate_resize_2d(dict(arrays), cval, output_size=(20, 24))
+                for key, value in out.items():
+                    self.assertEqual(value.shape, (20, 24))
+        finally:
+            random.setstate(random_state)
+
+    def test_rotate_branch_fills_new_corners_with_the_given_cval(self):
+        image = np.ones((10, 10), dtype=np.float32)
+        label = np.zeros((10, 10), dtype=np.int64)
+        arrays = {"image": image, "label": label}
+        cval = {"image": 0.0, "label": 4}
+        # First draw <= 0.5 skips rot_flip, second draw > 0.5 takes rotate;
+        # force a non-trivial angle so the rotation actually introduces corners.
+        calls = iter([0.1, 0.9])
+        original_random = random.random
+        original_randint = random.randint
+        random.random = lambda: next(calls, 0.9)
+        random.randint = lambda low, high: 15
+        try:
+            out = random_flip_rotate_resize_2d(arrays, cval, output_size=(10, 10))
+        finally:
+            random.random = original_random
+            random.randint = original_randint
+        self.assertIn(4, np.unique(out["label"]))
 
 
 class PatchPipelineEndToEndTests(unittest.TestCase):

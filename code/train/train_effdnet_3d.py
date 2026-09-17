@@ -1,16 +1,19 @@
-"""VNet3D + CycleMix (Zhang & Zhuang, CVPR 2022) on WORD's full-3D protocol.
+"""VNet3D + EFFDNet (Liu et al., MICCAI 2025) on WORD's full-3D protocol.
 
-Reimplements CycleMix's four-loss framework -- unmix pCE, mix pCE, global
-mix-invariance consistency and local connectivity consistency -- on top of
-this repository's ``VNet3D`` and ``ScribbleBench3DDataset``. See
-``code/utils/cyclemix.py`` for the exact 3D adaptation notes (in particular,
-the official Puzzle Mix solver is replaced with a 3D cuboid CutMix, which the
-paper lists as an admissible mix operator). ACDC/MSCMR train as independent
-2D slices instead; see ``train_cyclemix_2d.py``.
+Reimplements EFFDNet's Mean-Teacher framework -- partial cross-entropy on the
+student, a dense cross-entropy against the EMA teacher's (noise-perturbed)
+pseudo-label, a grid-based Foreground-Background Separation Loss (FBSL), and
+a Foreground Augmentation with Diverse Context (FADC) copy-paste
+augmentation -- on top of this repository's ``VNet3D`` and
+``ScribbleBench3DDataset``; see ``code/utils/effdnet.py`` for the algorithm,
+verified against the official ``Aurora-003-web/EFFDNet`` source. ACDC/MSCMR
+train as independent 2D slices instead; see ``train_effdnet_2d.py``.
 
 Only sparse labels in ``labelsTr`` contribute to optimization. Dense training
 labels are accessed exclusively for model selection on a patient-level
-holdout, exactly as in ``train_pce_3d.py``.
+holdout, exactly as in ``train_pce_3d.py``. The deployed/checkpointed model
+is the *student* (matching the source, not an EMA teacher), so
+``code/test/test_pce_3d.py`` evaluates ``best.pth`` directly.
 """
 
 import argparse
@@ -47,27 +50,21 @@ from train.common_3d import (  # noqa: E402
     seed_worker,
     validate,
 )
-from utils.cyclemix import (  # noqa: E402
-    largest_component_targets,
-    mix_images,
-    mix_labels,
-    negative_cosine_similarity,
-    occlude,
-    sample_batch_cuboid_masks,
+from utils.effdnet import (  # noqa: E402
+    foreground_augmentation_diverse_context,
+    foreground_background_separation_loss,
+    update_ema_variables,
 )
 
 SUPPORTED_DATASETS = ("WORD",)
 DEFAULTS = {
-    # CycleMix mixes each sample with another one drawn from the same batch,
-    # so batch_size must be >= 2; the pCE baseline's WORD default of 1 cannot
-    # be reused here.
-    "WORD": {"patch_size": (64, 96, 96), "batch_size": 2},
+    "WORD": {"patch_size": (64, 96, 96), "batch_size": 1},
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a 3D VNet from ScribbleBench scribbles with CycleMix"
+        description="Train a 3D VNet from ScribbleBench scribbles with EFFDNet"
     )
     parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS)
     parser.add_argument("--root_path", default=None)
@@ -102,18 +99,14 @@ def parse_args():
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", default=None)
 
-    # CycleMix loss weights (paper Eq. 14; the official code hard-codes 0.1
-    # for both consistency terms instead of the paper's reported 0.05/1.0 --
-    # we default to the paper's reported values).
-    parser.add_argument("--lambda_unmix", type=float, default=1.0)
-    parser.add_argument("--lambda_mix", type=float, default=1.0)
-    parser.add_argument("--lambda_con_global", type=float, default=0.05)
-    parser.add_argument("--lambda_con_local", type=float, default=1.0)
-    # Fraction of each patch axis covered by the mix box / occlusion box.
-    parser.add_argument("--mix_frac_low", type=float, default=0.3)
-    parser.add_argument("--mix_frac_high", type=float, default=0.7)
-    parser.add_argument("--occlusion_frac_low", type=float, default=0.1)
-    parser.add_argument("--occlusion_frac_high", type=float, default=0.3)
+    # EFFDNet-specific hyperparameters (paper defaults).
+    parser.add_argument("--ema_alpha", type=float, default=0.99, help="teacher EMA decay rate")
+    parser.add_argument("--lambda_value", type=float, default=0.6, help="pseudo-label loss weight (paper's lambda)")
+    parser.add_argument("--delta", type=float, default=0.3, help="FBSL weight within the pseudo-label term")
+    parser.add_argument("--num_regions", type=int, default=8, help="FBSL grid resolution per axis (paper's K)")
+    parser.add_argument("--fbsl_temperature", type=float, default=0.07)
+    parser.add_argument("--use_fbsl", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--use_fadc", type=int, default=1, choices=[0, 1])
     return parser.parse_args()
 
 
@@ -121,10 +114,8 @@ def validate_args(args):
     defaults = DEFAULTS[args.dataset]
     args.patch_size = tuple(args.patch_size or defaults["patch_size"])
     args.batch_size = args.batch_size or defaults["batch_size"]
-    if args.batch_size < 2:
-        raise ValueError("CycleMix pairs each sample with another one in the batch; batch_size must be >= 2")
-    if args.max_iterations < 1:
-        raise ValueError("max_iterations must be positive")
+    if args.max_iterations < 1 or args.batch_size < 1:
+        raise ValueError("max_iterations and batch_size must be positive")
     if args.n_filters < 1:
         raise ValueError("n_filters must be positive")
     if any(value < 1 for value in args.patch_size):
@@ -147,92 +138,65 @@ def validate_args(args):
         raise ValueError("invalid sliding-window settings")
     if args.temp_dir is not None and not Path(args.temp_dir).is_dir():
         raise ValueError("temp_dir does not exist: {}".format(args.temp_dir))
-    for name in ("mix_frac_low", "mix_frac_high", "occlusion_frac_low", "occlusion_frac_high"):
-        value = getattr(args, name)
-        if not 0 < value <= 1:
-            raise ValueError("{} must satisfy 0 < value <= 1".format(name))
-    if args.mix_frac_low > args.mix_frac_high:
-        raise ValueError("mix_frac_low must be <= mix_frac_high")
-    if args.occlusion_frac_low > args.occlusion_frac_high:
-        raise ValueError("occlusion_frac_low must be <= occlusion_frac_high")
+    if not 0 < args.ema_alpha < 1:
+        raise ValueError("ema_alpha must satisfy 0 < alpha < 1")
+    if args.lambda_value < 0 or args.delta < 0:
+        raise ValueError("lambda_value/delta must be non-negative")
+    if args.num_regions < 1:
+        raise ValueError("num_regions must be positive")
     return args
 
 
-def cyclemix_step(model, image, target, ignore_index, args, device):
-    """One CycleMix forward pass; returns the total loss and its components."""
-    batch_size = image.shape[0]
-    perm = (torch.arange(batch_size, device=device) + 1) % batch_size
+def effdnet_step(model, ema_model, image, target, ignore_index, args):
+    """One EFFDNet training iteration; returns the total loss and its
+    components. Shape-agnostic over the spatial rank (2D/3D), so this same
+    function is reused verbatim by ``train_effdnet_2d.py``.
+    """
+    logits, features = model(image, return_features=True)
+    feature = features["decoder"][-1]
 
-    logits = model(image)
-    loss_unmix, labeled_voxels = partial_cross_entropy(logits, target, ignore_index)
-    probs = F.softmax(logits, dim=1)
-    probs_partner = probs[perm]
+    with torch.no_grad():
+        noise = torch.clamp(torch.randn_like(image) * 0.1, -0.05, 0.05)
+        ema_logits = ema_model(image + noise)
+        pseudo_label = torch.argmax(torch.softmax(ema_logits, dim=1), dim=1)
 
-    mix_frac = (args.mix_frac_low, args.mix_frac_high)
-    occ_frac = (args.occlusion_frac_low, args.occlusion_frac_high)
+    loss_scribble, labeled_voxels = partial_cross_entropy(logits, target, ignore_index)
+    loss_pseudo = F.cross_entropy(logits, pseudo_label)
+    components = {"scribble": loss_scribble.item(), "pseudo": loss_pseudo.item(), "labeled_voxels": labeled_voxels.item()}
 
-    # Direction A: M(x, x[perm]) then occlude.
-    mask_mix_a = sample_batch_cuboid_masks(batch_size, args.patch_size, mix_frac, device)
-    mask_occ_a = sample_batch_cuboid_masks(batch_size, args.patch_size, occ_frac, device)
-    image_mix_a = mix_images(image, image[perm], mask_mix_a)
-    label_mix_a = mix_labels(target, target[perm], mask_mix_a)
-    image_occ_a, label_occ_a = occlude(image_mix_a, label_mix_a, mask_occ_a, ignore_index)
+    pseudo_term = loss_pseudo
+    if args.use_fbsl:
+        loss_fbsl = foreground_background_separation_loss(
+            feature, target, ignore_index, num_regions=args.num_regions, temperature=args.fbsl_temperature
+        )
+        components["fbsl"] = loss_fbsl.item()
+        pseudo_term = pseudo_term + args.delta * loss_fbsl
 
-    # Direction B: M(x[perm], x) with an independently sampled pair of boxes,
-    # since the paper's mix operator is not symmetric.
-    mask_mix_b = sample_batch_cuboid_masks(batch_size, args.patch_size, mix_frac, device)
-    mask_occ_b = sample_batch_cuboid_masks(batch_size, args.patch_size, occ_frac, device)
-    image_mix_b = mix_images(image[perm], image, mask_mix_b)
-    label_mix_b = mix_labels(target[perm], target, mask_mix_b)
-    image_occ_b, label_occ_b = occlude(image_mix_b, label_mix_b, mask_occ_b, ignore_index)
+    total = loss_scribble + args.lambda_value * pseudo_term
 
-    logits_occ_a = model(image_occ_a)
-    logits_occ_b = model(image_occ_b)
-    loss_mix_a, _ = partial_cross_entropy(logits_occ_a, label_occ_a, ignore_index)
-    loss_mix_b, _ = partial_cross_entropy(logits_occ_b, label_occ_b, ignore_index)
-    loss_mix = 0.5 * (loss_mix_a + loss_mix_b)
+    if args.use_fadc:
+        aug_image, aug_target, aug_pseudo = foreground_augmentation_diverse_context(
+            image, target, pseudo_label, ignore_index
+        )
+        aug_logits = model(aug_image)
+        loss_scribble_aug, _ = partial_cross_entropy(aug_logits, aug_target, ignore_index)
+        loss_pseudo_aug = F.cross_entropy(aug_logits, aug_pseudo)
+        total = total + loss_scribble_aug + args.lambda_value * loss_pseudo_aug
+        components["scribble_aug"] = loss_scribble_aug.item()
+        components["pseudo_aug"] = loss_pseudo_aug.item()
 
-    # Global consistency: mixing the two original predictions and zeroing the
-    # occluded region should match segmenting the occluded-mixed image directly.
-    keep_a = (~mask_occ_a).to(probs.dtype)
-    keep_b = (~mask_occ_b).to(probs.dtype)
-    target_probs_a = mix_images(probs, probs_partner, mask_mix_a) * keep_a
-    target_probs_b = mix_images(probs_partner, probs, mask_mix_b) * keep_b
-    pred_probs_a = F.softmax(logits_occ_a, dim=1) * keep_a
-    pred_probs_b = F.softmax(logits_occ_b, dim=1) * keep_b
-    loss_con_global = 0.5 * (
-        negative_cosine_similarity(target_probs_a, pred_probs_a)
-        + negative_cosine_similarity(target_probs_b, pred_probs_b)
-    )
-
-    # Local consistency: predictions should collapse onto a single connected
-    # component per foreground class. Every batch element already plays both
-    # the "sample 1" and "sample 2" role once (via `perm`), so a single mean
-    # over the batch already realizes the paper's symmetric 0.5*(term+term).
-    cleaned_targets = largest_component_targets(probs)
-    loss_con_local = negative_cosine_similarity(probs, cleaned_targets)
-
-    total = (
-        args.lambda_unmix * loss_unmix
-        + args.lambda_mix * loss_mix
-        + args.lambda_con_global * loss_con_global
-        + args.lambda_con_local * loss_con_local
-    )
-    components = {
-        "unmix": loss_unmix.item(),
-        "mix": loss_mix.item(),
-        "con_global": loss_con_global.item(),
-        "con_local": loss_con_local.item(),
-        "labeled_voxels": labeled_voxels.item(),
-    }
     return total, components
 
 
-def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
+def create_model(num_classes, n_filters, device):
+    return VNet3D(in_chns=1, class_num=num_classes, n_filters=n_filters).to(device)
+
+
+def checkpoint_payload(model, ema_model, optimizer, scaler, args, split, step, best_score):
     return {
         "schema_version": 1,
         "model_name": "vnet_3d",
-        "training_method": "cyclemix",
+        "training_method": "effdnet",
         "model_config": {
             "in_chns": 1,
             "class_num": len(DATASET_CONFIGS[args.dataset]["class_names"]),
@@ -246,7 +210,9 @@ def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
         },
         "global_step": step,
         "best_val_mean_dice": best_score,
+        # Deployed model is the student, matching the source.
         "model_state_dict": model.state_dict(),
+        "ema_state_dict": ema_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "split": split,
@@ -254,7 +220,7 @@ def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
     }
 
 
-def restore_checkpoint(path, model, optimizer, scaler, args, split):
+def restore_checkpoint(path, model, ema_model, optimizer, scaler, args, split):
     checkpoint = torch.load(path, map_location="cpu")
     expected_model = checkpoint.get("model_config", {})
     expected_data = checkpoint.get("data_config", {})
@@ -265,6 +231,7 @@ def restore_checkpoint(path, model, optimizer, scaler, args, split):
     if checkpoint.get("split") != split:
         raise ValueError("resume checkpoint train/val split does not match")
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    ema_model.load_state_dict(checkpoint["ema_state_dict"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scaler.load_state_dict(checkpoint.get("scaler_state_dict", {}))
     return int(checkpoint["global_step"]), float(checkpoint["best_val_mean_dice"])
@@ -287,7 +254,7 @@ def train(args):
     torch.backends.cudnn.deterministic = True
 
     output_dir = Path(
-        args.output_dir or REPO_ROOT / "checkpoints" / "ScribbleBench_CycleMix" / args.dataset
+        args.output_dir or REPO_ROOT / "checkpoints" / "ScribbleBench_EFFDNet" / args.dataset
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(output_dir)
@@ -327,21 +294,27 @@ def train(args):
         persistent_workers=args.num_workers > 0,
         worker_init_fn=seed_worker,
         generator=generator,
-        drop_last=True,  # CycleMix pairs samples in-batch; a size-1 final batch cannot pair.
+        drop_last=False,
     )
     if len(loader) == 0:
-        raise RuntimeError("training loader is empty (need at least 2 * batch_size training samples)")
+        raise RuntimeError("training loader is empty")
 
     num_classes = train_dataset.num_classes
     ignore_index = train_dataset.ignore_index
-    model = VNet3D(in_chns=1, class_num=num_classes, n_filters=args.n_filters).to(device)
+    # Student and teacher are independently initialized (verified against
+    # source: two separate `create_model()` calls, no state-dict copy).
+    model = create_model(num_classes, args.n_filters, device)
+    ema_model = create_model(num_classes, args.n_filters, device)
+    for parameter in ema_model.parameters():
+        parameter.detach_()
+
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.learning_rate, momentum=args.momentum, nesterov=True, weight_decay=args.weight_decay
     )
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     step, best_score = 0, -math.inf
     if args.resume:
-        step, best_score = restore_checkpoint(args.resume, model, optimizer, scaler, args, split)
+        step, best_score = restore_checkpoint(args.resume, model, ema_model, optimizer, scaler, args, split)
         logging.info("Resumed %s at iteration %d", args.resume, step)
         if step >= args.max_iterations:
             raise ValueError("resume checkpoint already reached max_iterations; increase --max_iterations")
@@ -357,6 +330,7 @@ def train(args):
     try:
         while step < args.max_iterations:
             model.train()
+            ema_model.train()
             for batch in loader:
                 image = batch["image"].to(device, non_blocking=True)
                 target = batch["label"].to(device, non_blocking=True).long()
@@ -368,10 +342,11 @@ def train(args):
                     torch.autocast(device_type="cuda", dtype=torch.float16) if args.amp else nullcontext()
                 )
                 with amp_context:
-                    loss, components = cyclemix_step(model, image, target, ignore_index, args, device)
+                    loss, components = effdnet_step(model, ema_model, image, target, ignore_index, args)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                update_ema_variables(model, ema_model, args.ema_alpha, step)
                 step += 1
 
                 writer.add_scalar("train/total", loss.item(), step)
@@ -380,9 +355,8 @@ def train(args):
                 writer.add_scalar("train/learning_rate", lr, step)
                 if step % 20 == 0:
                     logging.info(
-                        "iteration=%d/%d loss=%.6f unmix=%.6f mix=%.6f con_g=%.6f con_l=%.6f lr=%.6g",
-                        step, args.max_iterations, loss.item(), components["unmix"], components["mix"],
-                        components["con_global"], components["con_local"], lr,
+                        "iteration=%d/%d loss=%.6f scribble=%.6f pseudo=%.6f lr=%.6g",
+                        step, args.max_iterations, loss.item(), components["scribble"], components["pseudo"], lr,
                     )
 
                 should_checkpoint = (
@@ -412,14 +386,15 @@ def train(args):
                         handle.write(json.dumps(record, allow_nan=False) + "\n")
                     if score > best_score:
                         best_score = score
-                        payload = checkpoint_payload(model, optimizer, scaler, args, split, step, best_score)
+                        payload = checkpoint_payload(model, ema_model, optimizer, scaler, args, split, step, best_score)
                         atomic_torch_save(payload, output_dir / "best.pth")
                         logging.info("Saved best.pth: iteration=%d mean_dice=%.6f", step, score)
                     else:
                         logging.info("Validation: iteration=%d mean_dice=%.6f", step, score)
                     model.train()
+                    ema_model.train()
                     atomic_torch_save(
-                        checkpoint_payload(model, optimizer, scaler, args, split, step, best_score),
+                        checkpoint_payload(model, ema_model, optimizer, scaler, args, split, step, best_score),
                         output_dir / "last.pth",
                     )
                 if step >= args.max_iterations:

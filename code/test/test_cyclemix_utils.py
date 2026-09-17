@@ -11,6 +11,7 @@ CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
+from networks.unet_2d import UNet2D
 from networks.unet_3d import UNet3D
 from train.train_cyclemix_3d import cyclemix_step
 from utils.cyclemix import (
@@ -116,6 +117,25 @@ class LargestComponentTargetsTests(unittest.TestCase):
         cleaned = largest_component_targets(probs)
         self.assertTrue(torch.all(cleaned.argmax(dim=1) == 0))
 
+    def test_2d_keeps_only_largest_component_per_class(self):
+        # Two disjoint class-1 blobs (sizes 4 and 1) in a [B,C,H,W] tensor,
+        # the ACDC/MSCMR 2D slice pipeline's shape for this same function.
+        argmax = np.zeros((1, 6, 6), dtype=np.int64)
+        argmax[0, 0:2, 0:2] = 1  # size-4 component
+        argmax[0, 5, 5] = 1  # size-1 component, same class
+        probs = torch.nn.functional.one_hot(torch.from_numpy(argmax), num_classes=2)
+        probs = probs.permute(0, 3, 1, 2).float()
+        cleaned = largest_component_targets(probs)
+        self.assertEqual(tuple(cleaned.shape), (1, 2, 6, 6))
+        cleaned_argmax = cleaned.argmax(dim=1)[0].numpy()
+        self.assertTrue(np.all(cleaned_argmax[0:2, 0:2] == 1))
+        self.assertEqual(cleaned_argmax[5, 5], 0)  # smaller component dropped
+        self.assertEqual(cleaned_argmax.sum(), 4)
+
+    def test_rejects_unsupported_rank(self):
+        with self.assertRaisesRegex(ValueError, "expects"):
+            largest_component_targets(torch.rand(1, 2, 4))
+
 
 class CycleMixStepTests(unittest.TestCase):
     def test_step_produces_finite_loss_and_gradients(self):
@@ -148,14 +168,43 @@ class CycleMixStepTests(unittest.TestCase):
         grad_norm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
         self.assertGreater(grad_norm, 0.0)
 
+    def test_2d_step_produces_finite_loss_and_gradients(self):
+        # cyclemix_step reused verbatim by train_cyclemix_2d.py: same
+        # function, 2D-shaped patch_size/tensors.
+        torch.manual_seed(2)
+        np.random.seed(2)
+
+        class Args:
+            patch_size = (32, 32)
+            mix_frac_low = 0.3
+            mix_frac_high = 0.6
+            occlusion_frac_low = 0.1
+            occlusion_frac_high = 0.2
+            lambda_unmix = 1.0
+            lambda_mix = 1.0
+            lambda_con_global = 0.05
+            lambda_con_local = 1.0
+
+        model = UNet2D(in_chns=1, class_num=4, feature_chns=(4, 8, 16, 24, 32))
+        device = torch.device("cpu")
+        image = torch.randn(2, 1, *Args.patch_size)
+        target = torch.randint(0, 4, (2, *Args.patch_size))
+        target[:, 0, 0] = 4
+
+        loss, components = cyclemix_step(model, image, target, ignore_index=4, args=Args(), device=device)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        grad_norm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
+        self.assertGreater(grad_norm, 0.0)
+
     def test_batch_size_one_is_rejected_by_validate_args(self):
         from train.train_cyclemix_3d import validate_args
 
         class Args:
-            dataset = "ACDC"
+            dataset = "WORD"
             batch_size = 1
             patch_size = None
-            feature_channels = [16, 32, 64, 128, 256]
+            n_filters = 16
             max_iterations = 100
             early_interval = 10
             late_interval = 10

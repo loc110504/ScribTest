@@ -1,8 +1,9 @@
-"""Test UNetCCT3D+DMSPS checkpoints on the official ScribbleBench test split.
+"""Test VNetCCT3D+DMSPS checkpoints on WORD's official ScribbleBench test
+split. ACDC/MSCMR checkpoints are evaluated by ``test_dmsps_2d.py`` instead.
 
 Mirrors ``test_pce_3d.py``; only the model class and its main-decoder-only
 wrapper differ, since a DMSPS checkpoint stores a dual-decoder DB-Net instead
-of a plain ``UNet3D``.
+of a plain ``VNet3D``.
 """
 
 import argparse
@@ -23,7 +24,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from dataloader.scribblebench_3d import ScribbleBench3DDataset  # noqa: E402
-from networks.unet_cct_3d import UNetCCT3D  # noqa: E402
+from networks.vnet_3d import VNetCCT3D  # noqa: E402
 from train.legacy_splits import published_test_groups  # noqa: E402
 from utils.sliding_window_3d import sliding_window_predict  # noqa: E402
 
@@ -74,11 +75,13 @@ def evaluate(args):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if checkpoint.get("schema_version") != 1:
         raise ValueError("checkpoint is not a schema-v1 checkpoint")
-    if checkpoint.get("model_name") != "unet_cct_3d":
+    if checkpoint.get("model_name") != "vnet_cct_3d":
         raise ValueError("checkpoint was not produced by train_dmsps_3d.py")
     model_config = checkpoint["model_config"]
     data_config = checkpoint["data_config"]
     dataset_name = data_config["dataset"]
+    if dataset_name != "WORD":
+        raise ValueError("test_dmsps_3d.py only evaluates WORD checkpoints; use test_dmsps_2d.py for ACDC/MSCMR")
     patch_size = tuple(data_config["patch_size_dhw"])
     dataset = ScribbleBench3DDataset(dataset_name, base_dir=args.root_path, split="test", sup_type="dense")
 
@@ -103,10 +106,10 @@ def evaluate(args):
         raise ValueError("checkpoint class count does not match the dataset")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     use_amp = args.amp and device.type == "cuda"
-    dual_model = UNetCCT3D(
+    dual_model = VNetCCT3D(
         in_chns=model_config["in_chns"],
         class_num=model_config["class_num"],
-        feature_chns=tuple(model_config["feature_chns"]),
+        n_filters=model_config["n_filters"],
         perturbations=tuple(model_config.get("perturbations", ["dropout"])),
         perturbation_dropout=model_config.get("perturbation_dropout", 0.5),
     ).to(device)

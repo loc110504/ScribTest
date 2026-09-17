@@ -24,16 +24,30 @@ def net_factory(
         "3d_nnunet": "nnunet_3d",
         "3d_unet_cct": "unet_cct_3d",
         "3d_unet_ctt": "unet_cct_3d",
+        "3d_vnet": "vnet_3d",
+        "3d_vnet_cct": "vnet_cct_3d",
         "unet_ctt_3d": "unet_cct_3d",
+        "vnet_ctt_3d": "vnet_cct_3d",
         "unet3d": "unet_3d",
         "resunet3d": "resunet_3d",
         "nnunet3d": "nnunet_3d",
         "unetcct3d": "unet_cct_3d",
         "unetctt3d": "unet_cct_3d",
+        "vnet3d": "vnet_3d",
+        "vnetcct3d": "vnet_cct_3d",
+        "vnetctt3d": "vnet_cct_3d",
         "resunet": "resunet_3d",
         "nnunet": "nnunet_3d",
         "unet_ctt": "unet_cct_3d",
+        "vnet_ctt": "vnet_cct_3d",
     }
+    aliases_2d = {
+        "unet2d": "unet_2d",
+        "unetcct2d": "unet_cct_2d",
+        "unetctt2d": "unet_cct_2d",
+        "unet_ctt_2d": "unet_cct_2d",
+    }
+    net_type = aliases_2d.get(net_type, net_type)
     net_type = aliases_3d.get(net_type, net_type)
     if spatial_dims == 3 and not net_type.endswith("_3d"):
         net_type = aliases_3d.get("3d_{}".format(net_type), "{}_3d".format(net_type))
@@ -54,6 +68,22 @@ def net_factory(
         from networks.unet_cct_3d import UNetCCT3D
 
         net = UNetCCT3D(in_chns=in_chns, class_num=class_num, **network_kwargs)
+    elif net_type == "vnet_3d":
+        from networks.vnet_3d import VNet3D
+
+        net = VNet3D(in_chns=in_chns, class_num=class_num, **network_kwargs)
+    elif net_type == "vnet_cct_3d":
+        from networks.vnet_3d import VNetCCT3D
+
+        net = VNetCCT3D(in_chns=in_chns, class_num=class_num, **network_kwargs)
+    elif net_type == "unet_2d":
+        from networks.unet_2d import UNet2D
+
+        net = UNet2D(in_chns=in_chns, class_num=class_num, **network_kwargs)
+    elif net_type == "unet_cct_2d":
+        from networks.unet_2d import UNetCCT2D
+
+        net = UNetCCT2D(in_chns=in_chns, class_num=class_num, **network_kwargs)
     elif net_type == "unet":
         from networks.unet import UNet
 

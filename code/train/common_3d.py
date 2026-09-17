@@ -24,6 +24,11 @@ from utils.sliding_window_3d import sliding_window_predict
 def partial_cross_entropy(logits, target, ignore_index):
     """Mean CE over annotated voxels only; unlabeled voxels have no gradient.
 
+    Shape-agnostic over the spatial rank: ``F.cross_entropy`` itself already
+    accepts any ``[B, C, *spatial]``/``[B, *spatial]`` pair, so this same
+    function backs every training script, 3D volume patches (``[B,C,D,H,W]``)
+    and ACDC/MSCMR's 2D slice pipeline (``[B,C,H,W]``) alike.
+
     With uniform random cropping (``foreground_crop_prob=0``, matching the
     official CycleMix/DMSPS training recipes), a patch can legitimately
     contain zero annotated voxels. That patch contributes zero loss/gradient
@@ -31,9 +36,9 @@ def partial_cross_entropy(logits, target, ignore_index):
     the autograd graph so ``.backward()`` stays valid for callers (e.g.
     CycleMix) that combine this with other loss terms.
     """
-    if logits.ndim != 5 or target.shape != logits.shape[:1] + logits.shape[2:]:
+    if logits.ndim not in (4, 5) or target.shape != logits.shape[:1] + logits.shape[2:]:
         raise ValueError(
-            "Expected logits [B,C,D,H,W] and target [B,D,H,W], got {} and {}".format(
+            "Expected logits [B,C,H,W] or [B,C,D,H,W] and a matching target, got {} and {}".format(
                 tuple(logits.shape), tuple(target.shape)
             )
         )

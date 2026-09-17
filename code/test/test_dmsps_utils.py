@@ -12,9 +12,11 @@ CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
+from networks.unet_2d import UNetCCT2D
 from networks.unet_cct_3d import UNetCCT3D
 from train.train_dmsps_3d import dmsps_step
 from utils.dmsps import (
+    dual_branch_slice_stack_probs,
     dual_branch_volume_probs,
     dynamic_mixed_pseudo_label,
     expand_labels,
@@ -114,6 +116,28 @@ class ExpandLabelsTests(unittest.TestCase):
         expanded = expand_labels(scribble, mean_probs, ignore_index=4, tau=0.1)
         self.assertTrue(np.all(expanded == 4))
 
+    def test_2d_slice_keeps_only_largest_confident_component_per_class(self):
+        # Same scenario as the 3D case, one spatial rank down: mean_probs is
+        # [C, H, W] (a single slice), 8-connectivity instead of 26.
+        shape = (6, 6)
+        scribble = np.full(shape, 4, dtype=np.int64)
+        mean_probs = np.zeros((4,) + shape, dtype=np.float32)
+        mean_probs[0] = 1.0
+        mean_probs[:, 0:2, 0:2] = 0.0
+        mean_probs[1, 0:2, 0:2] = 0.99
+        mean_probs[0, 0:2, 0:2] = 0.01
+        mean_probs[:, 5, 5] = 0.0
+        mean_probs[1, 5, 5] = 0.99
+        mean_probs[0, 5, 5] = 0.01
+
+        expanded = expand_labels(scribble, mean_probs, ignore_index=4, tau=0.5)
+        self.assertTrue(np.all(expanded[0:2, 0:2] == 1))
+        self.assertEqual(expanded[5, 5], 4)
+
+    def test_rejects_unsupported_rank(self):
+        with self.assertRaisesRegex(ValueError, "must be"):
+            expand_labels(np.zeros((2, 2)), np.zeros((3, 2, 2, 2, 2)), ignore_index=4, tau=0.5)
+
 
 class DualBranchVolumeProbsTests(unittest.TestCase):
     def test_output_shape_and_probability_simplex(self):
@@ -127,6 +151,32 @@ class DualBranchVolumeProbsTests(unittest.TestCase):
         self.assertEqual(probs.shape, (3, 16, 32, 32))
         sums = probs.sum(axis=0)
         np.testing.assert_allclose(sums, np.ones_like(sums), atol=1e-4)
+
+
+class DualBranchSliceStackProbsTests(unittest.TestCase):
+    def test_output_shape_and_probability_simplex(self):
+        torch.manual_seed(0)
+        model = UNetCCT2D(in_chns=1, class_num=3)
+        model.eval()
+        # Slices at a native resolution different from patch_size, so the
+        # resize-then-restore round trip is actually exercised.
+        image = np.random.randn(5, 20, 24).astype(np.float32)
+        probs = dual_branch_slice_stack_probs(
+            model, image, num_classes=3, patch_size=(32, 32), device=torch.device("cpu")
+        )
+        self.assertEqual(probs.shape, (3, 5, 20, 24))
+        sums = probs.sum(axis=0)
+        np.testing.assert_allclose(sums, np.ones_like(sums), atol=1e-4)
+
+    def test_squeezes_leading_singleton_dims(self):
+        torch.manual_seed(0)
+        model = UNetCCT2D(in_chns=1, class_num=2)
+        model.eval()
+        image = np.random.randn(1, 3, 16, 16).astype(np.float32)
+        probs = dual_branch_slice_stack_probs(
+            model, image, num_classes=2, patch_size=(16, 16), device=torch.device("cpu")
+        )
+        self.assertEqual(probs.shape, (2, 3, 16, 16))
 
 
 class DMSPSStepTests(unittest.TestCase):
@@ -149,6 +199,26 @@ class DMSPSStepTests(unittest.TestCase):
         self.assertGreaterEqual(components["alpha"], 0.0)
         self.assertLessEqual(components["alpha"], 1.0)
 
+        loss.backward()
+        grad_norm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
+        self.assertGreater(grad_norm, 0.0)
+
+    def test_2d_step_produces_finite_loss_and_gradients(self):
+        # dmsps_step reused verbatim by train_dmsps_2d.py: same function, a
+        # UNetCCT2D model and 2D-shaped tensors.
+        torch.manual_seed(3)
+        np.random.seed(3)
+
+        class Args:
+            lambda_sps = 8.0
+
+        model = UNetCCT2D(in_chns=1, class_num=4, feature_chns=(4, 8, 16, 24, 32))
+        image = torch.randn(2, 1, 32, 32)
+        target = torch.randint(0, 4, (2, 32, 32))
+        target[:, 0, 0] = 4
+
+        loss, components = dmsps_step(model, image, target, ignore_index=4, args=Args())
+        self.assertTrue(torch.isfinite(loss))
         loss.backward()
         grad_norm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
         self.assertGreater(grad_norm, 0.0)
