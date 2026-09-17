@@ -250,7 +250,7 @@ data/<ACDC|MSCMR>/   # Not committed to git -- the expert-scribble h5 archive (s
   # published subject set)
 
 checkpoints/   # best.pth, last.pth, split.json, train.log, tensorboard/ (train output)
-results/       # metrics.json, baselines_summary.csv / expert_scribble_summary.csv (test output)
+results/       # metrics.json, baselines_summary.csv / expert_baselines_summary.csv (test output)
 ```
 
 ### Key invariants

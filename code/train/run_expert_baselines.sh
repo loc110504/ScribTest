@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Train + test pCE, CycleMix, SDT-Net, VoxTrust-3D, EFFDNet, SC-MT and DMSPS
-# (stage 1 and stage 2) on the "expert scribble" ACDC/MSCMR archive
+# Train + test pCE, CycleMix, SDT-Net, EFFDNet, SC-MT and DMSPS (stage 1 and
+# stage 2) on the "expert scribble" ACDC/MSCMR archive
 # (<repo_root>/data/{ACDC,MSCMR}, the original WSL4MIS/CycleMix h5 dataset),
 # plus ModelMix jointly on ACDC+MSCMR, appending every result to one summary
 # CSV -- the *_2d_expert.py counterpart of run_baselines.sh, kept as a
@@ -11,28 +11,31 @@
 # convention and published train/val/test patient split, different literal
 # scribble/preprocessing source).
 #
+# VoxTrust-3D is deliberately not part of this sweep (its
+# train_voxtrust3d_2d_expert.py script still exists and can be run
+# standalone, see its --help, but is not wired in here).
+#
 # This archive is 2D-only (WORD has no expert-scribble counterpart here), so
 # unlike run_baselines.sh there is no 2D/3D dimension split to route.
 #
 #   1. train_pce_2d_expert.py       -> test_pce_2d_expert.py
 #   2. train_cyclemix_2d_expert.py  -> test_pce_2d_expert.py
 #   3. train_sdtnet_2d_expert.py    -> test_pce_2d_expert.py
-#   4. train_voxtrust3d_2d_expert.py-> test_pce_2d_expert.py
-#   5. train_effdnet_2d_expert.py   -> test_pce_2d_expert.py
-#   6. train_scmt_2d_expert.py      -> test_pce_2d_expert.py
-#   7. train_dmsps_2d_expert.py     -> test_dmsps_2d_expert.py (--stage 1/2)
+#   4. train_effdnet_2d_expert.py   -> test_pce_2d_expert.py
+#   5. train_scmt_2d_expert.py      -> test_pce_2d_expert.py
+#   6. train_dmsps_2d_expert.py     -> test_dmsps_2d_expert.py (--stage 1/2)
 #
-# pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/SC-MT all checkpoint a plain
-# UNet2D (VoxTrust-3D's and SC-MT's deployed model is their EMA teacher,
-# EFFDNet's is its student) -- so all six share test_pce_2d_expert.py; DMSPS's
-# dual-decoder DB-Net has its own evaluator, test_dmsps_2d_expert.py.
+# pCE/CycleMix/SDT-Net/EFFDNet/SC-MT all checkpoint a plain UNet2D (SC-MT's
+# deployed model is its EMA teacher, EFFDNet's is its student) -- so all five
+# share test_pce_2d_expert.py; DMSPS's dual-decoder DB-Net has its own
+# evaluator, test_dmsps_2d_expert.py.
 #
 # ModelMix (Zhang & Patel, MICCAI 2024) is run separately, once, after the
 # per-dataset loop below: it always jointly trains ACDC+MSCMR in one run (no
 # --dataset flag) and is skipped unless both are in `datasets` below.
 #
 # Every train+test cycle appends one row to the results CSV (default:
-# results/expert_scribble_summary.csv) via append_metrics_csv.py. The CSV is
+# results/expert_baselines_summary.csv) via append_metrics_csv.py. The CSV is
 # append-only across script runs, same as run_baselines.sh.
 #
 # Environment variable overrides (all optional):
@@ -45,7 +48,7 @@
 #                                     default <repo_root>/data)
 #   SCRIBBLE_EXPERT_CHECKPOINT_ROOT   default "<repo>/checkpoints"
 #   SCRIBBLE_EXPERT_RESULTS_ROOT      default "<repo>/results"
-#   SCRIBBLE_EXPERT_CSV               default "<results_root>/expert_scribble_summary.csv"
+#   SCRIBBLE_EXPERT_CSV               default "<results_root>/expert_baselines_summary.csv"
 #   SCRIBBLE_EXTRA_TRAIN_ARGS         extra args appended to every train_*.py call
 #   SCRIBBLE_EXTRA_TEST_ARGS          extra args appended to every test_*.py call
 #
@@ -73,7 +76,7 @@ extra_test_args="${SCRIBBLE_EXTRA_TEST_ARGS:-}"
 
 checkpoint_root="${SCRIBBLE_EXPERT_CHECKPOINT_ROOT:-$repo_dir/checkpoints}"
 results_root="${SCRIBBLE_EXPERT_RESULTS_ROOT:-$repo_dir/results}"
-csv_path="${SCRIBBLE_EXPERT_CSV:-$results_root/expert_scribble_summary.csv}"
+csv_path="${SCRIBBLE_EXPERT_CSV:-$results_root/expert_baselines_summary.csv}"
 
 append_row() {
   # args: method dataset stage checkpoint metrics_json
@@ -103,11 +106,6 @@ train_and_test() {
         --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
         $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
       ;;
-    VoxTrust3D)
-      python "$script_dir/train_voxtrust3d_2d_expert.py" --dataset "$dataset" \
-        --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
-        $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
-      ;;
     EFFDNet)
       python "$script_dir/train_effdnet_2d_expert.py" --dataset "$dataset" \
         --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
@@ -131,7 +129,7 @@ train_and_test() {
 
   echo "=== [$method_label] dataset=$dataset (expert) stage=${stage:-none}: test ==="
   case "$method_label" in
-    pCE|CycleMix|SDTNet|VoxTrust3D|EFFDNet|SCMT)
+    pCE|CycleMix|SDTNet|EFFDNet|SCMT)
       python "$test_dir/test_pce_2d_expert.py" \
         --checkpoint "$ckpt_dir/best.pth" --output_dir "$results_dir" \
         $amp_flag $device_flag $root_path_flag $extra_test_args
@@ -158,10 +156,6 @@ for dataset in "${datasets[@]}"; do
   train_and_test SDTNet "$dataset" "" \
     "$checkpoint_root/ExpertScribble_SDTNet/$dataset" \
     "$results_root/ExpertScribble_SDTNet/$dataset"
-
-  train_and_test VoxTrust3D "$dataset" "" \
-    "$checkpoint_root/ExpertScribble_VoxTrust3D/$dataset" \
-    "$results_root/ExpertScribble_VoxTrust3D/$dataset"
 
   train_and_test EFFDNet "$dataset" "" \
     "$checkpoint_root/ExpertScribble_EFFDNet/$dataset" \
