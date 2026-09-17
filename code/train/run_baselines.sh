@@ -45,8 +45,8 @@
 #
 # Environment variable overrides (all optional):
 #   SCRIBBLE_DATASETS                space-separated subset, default "ACDC MSCMR WORD"
-#   SCRIBBLE_BATCH_SIZE               default 4; forwarded as --batch_size to every train_*.py call
-#   SCRIBBLE_AMP_FLAG                default "--amp"; set to "" to disable AMP
+#   SCRIBBLE_BATCH_SIZE               default 8; forwarded as --batch_size to every train_*.py call
+#   SCRIBBLE_AMP_FLAG                default "" (AMP off); set to "--amp" to enable AMP
 #   SCRIBBLE_DEVICE                  e.g. "cpu"; forwarded as --device to every command
 #   SCRIBBLE_ROOT_PATH               ScribbleBench root override (--root_path)
 #   SCRIBBLE_BASELINES_CHECKPOINT_ROOT default "<repo>/checkpoints"
@@ -68,8 +68,8 @@ repo_dir="$(cd "$script_dir/../.." && pwd)"
 test_dir="$repo_dir/code/test"
 
 datasets=(${SCRIBBLE_DATASETS:-ACDC MSCMR WORD})
-batch_size="${SCRIBBLE_BATCH_SIZE:-4}"
-amp_flag="${SCRIBBLE_AMP_FLAG-"--amp"}"
+batch_size="${SCRIBBLE_BATCH_SIZE:-8}"
+amp_flag="${SCRIBBLE_AMP_FLAG-}"
 device_flag="${SCRIBBLE_DEVICE:+--device $SCRIBBLE_DEVICE}"
 root_path_flag="${SCRIBBLE_ROOT_PATH:+--root_path $SCRIBBLE_ROOT_PATH}"
 extra_train_args="${SCRIBBLE_EXTRA_TRAIN_ARGS:-}"
