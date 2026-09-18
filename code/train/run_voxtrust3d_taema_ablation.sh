@@ -21,10 +21,22 @@
 # and appends one row per arm to the summary CSV (method=VoxTrust3D,
 # stage=ta_ema_off/ta_ema_on) so both can be compared side by side.
 #
+# --max_iterations went from the training scripts' own default of 30000 to
+# 35000 here, but --warmup_frac/--rampup_frac (fractions of --max_iterations)
+# and --late_phase_start (an absolute iteration count) are all left at their
+# *absolute* iteration counts under the original 30000-iteration protocol --
+# warm-up still ends at iteration 3000, the pseudo-label weight still finishes
+# ramping up by iteration 9000, and the finer late-phase checkpoint cadence
+# still starts at iteration 20000. The extra 5000 iterations are pure
+# additional training time in that same late phase, not a rescaled schedule.
+#
 # Environment variable overrides (all optional):
 #   SCRIBBLE_DATASETS                space-separated subset, default "ACDC MSCMR"
 #   SCRIBBLE_SEED                    default 2026; SAME seed used for both arms
 #   SCRIBBLE_MAX_ITERATIONS          default 35000; forwarded as --max_iterations
+#   SCRIBBLE_WARMUP_ITERS            default 3000 (absolute); converted to --warmup_frac
+#   SCRIBBLE_RAMPUP_ITERS            default 6000 (absolute); converted to --rampup_frac
+#   SCRIBBLE_LATE_PHASE_START        default 20000 (absolute); forwarded as --late_phase_start
 #   SCRIBBLE_BATCH_SIZE              default 8; forwarded as --batch_size
 #   SCRIBBLE_AMP_FLAG                default "" (AMP off); set to "--amp" to enable AMP
 #   SCRIBBLE_DEVICE                  e.g. "cuda" or "cpu"; forwarded as --device
@@ -36,10 +48,12 @@
 #   SCRIBBLE_EXTRA_TRAIN_ARGS         extra args appended to every train_voxtrust3d_*.py call
 #   SCRIBBLE_EXTRA_TEST_ARGS          extra args appended to every test_pce_*.py call
 #
-# Example - quick end-to-end smoke run on CPU, ACDC only:
+# Example - quick end-to-end smoke run on CPU, ACDC only (the default
+# warmup/rampup/late-phase absolute values only make sense at 35000
+# iterations, so scale them down too for a tiny smoke run):
 #   SCRIBBLE_DATASETS=ACDC SCRIBBLE_DEVICE=cpu SCRIBBLE_AMP_FLAG="" SCRIBBLE_BATCH_SIZE=2 SCRIBBLE_NUM_WORKERS=0 \
-#   SCRIBBLE_MAX_ITERATIONS=8 \
-#   SCRIBBLE_EXTRA_TRAIN_ARGS="--warmup_frac 0.25 --rampup_frac 0.25 --early_interval 4 --late_interval 4 --late_phase_start 4" \
+#   SCRIBBLE_MAX_ITERATIONS=8 SCRIBBLE_WARMUP_ITERS=2 SCRIBBLE_RAMPUP_ITERS=2 SCRIBBLE_LATE_PHASE_START=4 \
+#   SCRIBBLE_EXTRA_TRAIN_ARGS="--early_interval 4 --late_interval 4" \
 #   SCRIBBLE_EXTRA_TEST_ARGS="--case_limit 2" \
 #   bash code/train/run_voxtrust3d_taema_ablation.sh
 
@@ -52,6 +66,14 @@ test_dir="$repo_dir/code/test"
 datasets=(${SCRIBBLE_DATASETS:-ACDC MSCMR})
 seed="${SCRIBBLE_SEED:-2026}"
 max_iterations="${SCRIBBLE_MAX_ITERATIONS:-35000}"
+warmup_iters="${SCRIBBLE_WARMUP_ITERS:-3000}"
+rampup_iters="${SCRIBBLE_RAMPUP_ITERS:-6000}"
+late_phase_start="${SCRIBBLE_LATE_PHASE_START:-20000}"
+# warmup_frac/rampup_frac are fractions of --max_iterations, so they must be
+# recomputed here to keep the *absolute* warm-up/ramp-up iteration counts
+# fixed even as --max_iterations changes (see header comment).
+warmup_frac="$(awk -v w="$warmup_iters" -v m="$max_iterations" 'BEGIN { printf "%.10f", w / m }')"
+rampup_frac="$(awk -v r="$rampup_iters" -v m="$max_iterations" 'BEGIN { printf "%.10f", r / m }')"
 batch_size="${SCRIBBLE_BATCH_SIZE:-8}"
 amp_flag="${SCRIBBLE_AMP_FLAG-}"
 device_flag="${SCRIBBLE_DEVICE:+--device $SCRIBBLE_DEVICE}"
@@ -79,9 +101,11 @@ run_arm() {
   ckpt_dir="$checkpoint_root/ScribbleBench_VoxTrust3D_ablation/$dataset/$stage_label"
   results_dir="$results_root/ScribbleBench_VoxTrust3D_ablation/$dataset/$stage_label"
 
-  echo "=== [VoxTrust3D/$stage_label] dataset=$dataset ($dim) seed=$seed max_iterations=$max_iterations: train ==="
+  echo "=== [VoxTrust3D/$stage_label] dataset=$dataset ($dim) seed=$seed max_iterations=$max_iterations" \
+       "(warmup_iters=$warmup_iters rampup_iters=$rampup_iters late_phase_start=$late_phase_start): train ==="
   python "$script_dir/train_voxtrust3d_${dim}.py" --dataset "$dataset" --seed "$seed" \
     --ta_ema "$ta_ema_flag" --max_iterations "$max_iterations" \
+    --warmup_frac "$warmup_frac" --rampup_frac "$rampup_frac" --late_phase_start "$late_phase_start" \
     --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
     $amp_flag $device_flag $root_path_flag $extra_train_args
 
