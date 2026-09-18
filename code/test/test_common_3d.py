@@ -2,7 +2,9 @@
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -10,7 +12,7 @@ CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from train.common_3d import partial_cross_entropy
+from train.common_3d import guard_fresh_output_dir, partial_cross_entropy
 
 
 class PartialCrossEntropyTests(unittest.TestCase):
@@ -44,6 +46,37 @@ class PartialCrossEntropyTests(unittest.TestCase):
         target[0, 0, 0, 0] = 5  # not a valid class and not ignore_index(3)
         with self.assertRaises(ValueError):
             partial_cross_entropy(logits, target, ignore_index=3)
+
+
+class GuardFreshOutputDirTests(unittest.TestCase):
+    def test_empty_directory_allows_fresh_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            guard_fresh_output_dir(Path(tmp), resume=None)  # must not raise
+
+    def test_fresh_start_into_existing_best_pth_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "best.pth").touch()
+            with self.assertRaisesRegex(ValueError, "best.pth"):
+                guard_fresh_output_dir(Path(tmp), resume=None)
+
+    def test_fresh_start_into_existing_last_pth_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "last.pth").touch()
+            with self.assertRaisesRegex(ValueError, "last.pth"):
+                guard_fresh_output_dir(Path(tmp), resume=None)
+
+    def test_resume_bypasses_the_guard_even_with_existing_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "best.pth").touch()
+            guard_fresh_output_dir(Path(tmp), resume=str(Path(tmp) / "best.pth"))  # must not raise
+
+    def test_custom_checkpoint_names_are_honored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ACDC" / "best.pth").parent.mkdir(parents=True)
+            (Path(tmp) / "ACDC" / "best.pth").touch()
+            with self.assertRaises(ValueError):
+                guard_fresh_output_dir(Path(tmp) / "ACDC", resume=None, checkpoint_names=("best.pth",))
+            guard_fresh_output_dir(Path(tmp) / "MSCMR", resume=None, checkpoint_names=("best.pth",))
 
 
 if __name__ == "__main__":

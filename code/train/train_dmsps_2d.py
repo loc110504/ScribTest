@@ -47,7 +47,7 @@ from dataloader.scribblebench_2d import RandomGenerator2D, ScribbleBench2DDatase
 from dataloader.scribblebench_3d import DATASET_CONFIGS  # noqa: E402
 from networks.unet_2d import UNetCCT2D  # noqa: E402
 from train.common_2d import validate_2d  # noqa: E402
-from train.common_3d import atomic_torch_save, checkpoint_due, seed_everything, seed_worker  # noqa: E402
+from train.common_3d import atomic_torch_save, checkpoint_due, guard_fresh_output_dir, seed_everything, seed_worker  # noqa: E402
 from train.train_dmsps_3d import dmsps_step  # noqa: E402
 from train.train_pce_2d import build_val_dataset, resolve_case_split  # noqa: E402
 from utils.dmsps import dual_branch_slice_stack_probs, expand_labels  # noqa: E402
@@ -253,6 +253,7 @@ def train(args):
         or REPO_ROOT / "checkpoints" / "ScribbleBench_DMSPS" / args.dataset / "stage{}".format(args.stage)
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    guard_fresh_output_dir(output_dir, args.resume)
     configure_logging(output_dir)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.amp and device.type != "cuda":

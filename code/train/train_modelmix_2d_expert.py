@@ -39,7 +39,7 @@ from dataloader.scribblebench_2d import RandomGenerator2D  # noqa: E402
 from dataloader.scribblebench_3d import DATASET_CONFIGS  # noqa: E402
 from networks.unet_2d import UNet2D  # noqa: E402
 from train.common_2d import validate_2d  # noqa: E402
-from train.common_3d import atomic_torch_save, checkpoint_due, seed_everything, seed_worker  # noqa: E402
+from train.common_3d import atomic_torch_save, checkpoint_due, guard_fresh_output_dir, seed_everything, seed_worker  # noqa: E402
 from train.train_modelmix_2d import modelmix_task_step  # noqa: E402
 from train.train_pce_2d_expert import build_val_dataset, resolve_case_split, resolve_val_indices  # noqa: E402
 
@@ -245,6 +245,9 @@ def train(args):
         args.amp = False
 
     tasks = {name: TaskState(name, args, device) for name in TASKS}
+    resume_paths = {"ACDC": args.resume_acdc, "MSCMR": args.resume_mscmr}
+    for name, task in tasks.items():
+        guard_fresh_output_dir(task.output_dir, resume_paths[name])
     configure_logging(tasks["ACDC"].output_dir.parent)
 
     optimizer = torch.optim.SGD(
@@ -254,7 +257,6 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     step, best_scores = 0, {name: -math.inf for name in TASKS}
-    resume_paths = {"ACDC": args.resume_acdc, "MSCMR": args.resume_mscmr}
     for name, task in tasks.items():
         if resume_paths[name]:
             resumed_step, resumed_best = restore_checkpoint(resume_paths[name], task.model, args, name, task.split)

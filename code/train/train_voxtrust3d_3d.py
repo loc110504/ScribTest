@@ -62,6 +62,7 @@ from networks.vnet_3d import VNet3D  # noqa: E402
 from train.common_3d import (  # noqa: E402
     atomic_torch_save,
     checkpoint_due,
+    guard_fresh_output_dir,
     make_published_split,
     partial_cross_entropy,
     seed_everything,
@@ -635,6 +636,7 @@ def train(args):
         args.output_dir or REPO_ROOT / "checkpoints" / "ScribbleBench_VoxTrust3D" / args.dataset
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    guard_fresh_output_dir(output_dir, args.resume)
     configure_logging(output_dir)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.amp and device.type != "cuda":

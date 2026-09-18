@@ -316,6 +316,18 @@ results/       # metrics.json, baselines_summary.csv / expert_baselines_summary.
   `test_pce_2d_expert.py`/`test_dmsps_2d_expert.py` check for it and refuse a ScribbleBench
   checkpoint (and vice versa) rather than silently evaluating it against the wrong image
   normalization convention.
+- **Every `train_*.py` script refuses a fresh (non-`--resume`) run into an `--output_dir` that
+  already has a `best.pth`/`last.pth`** (`common_3d.guard_fresh_output_dir`, or a local copy of it
+  in `train_pce_3d.py`, which predates that shared module). Without this guard, a fresh run resets
+  `best_score` to `-inf` and silently overwrites a better prior checkpoint the moment its own
+  (initially far worse) validation score first beats `-inf` — this bit a real VoxTrust-3D run where
+  a completed 30k-iteration checkpoint got destroyed by an accidental second fresh launch into the
+  same directory, then the wrong (stale, pre-destruction) checkpoint was quoted as "the" result.
+  Always give each training run its own never-reused `--output_dir` (e.g. suffix with `_run1`,
+  `_run2`, ...), and pass `--resume <path>` explicitly when you do mean to continue a run. This
+  matters especially for ablations (e.g. `--ta_ema 0` vs `--ta_ema 1`): use the same `--seed`, two
+  distinct fresh `--output_dir`s, and let both run to completion uninterrupted, or the comparison is
+  not apples-to-apples.
 - **Crop/resize policy**: WORD defaults to `--foreground_crop_prob 0` (uniform random 3D crop,
   matching the official CycleMix/DMSPS/SDT-Net recipes). ACDC/MSCMR use `RandomGenerator2D`'s fixed
   policy (50% rot90+flip, else 25% random rotate ±20°, else identity, always resized to

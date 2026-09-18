@@ -175,3 +175,33 @@ def atomic_torch_save(payload, path):
     temporary = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+
+
+def guard_fresh_output_dir(output_dir, resume, checkpoint_names=("best.pth", "last.pth")):
+    """Refuse a fresh (non-``--resume``) run into an ``output_dir`` that already
+    holds a checkpoint from a previous run.
+
+    Every ``train_*.py`` script resets ``best_score`` to ``-inf`` unless
+    ``--resume`` is passed. Restarting a fresh run into a directory that already
+    has a ``best.pth`` therefore silently overwrites it the moment the new run's
+    own (initially far worse) validation score first exceeds ``-inf`` --
+    destroying a better prior checkpoint with no warning at all. Call this once,
+    right after creating ``output_dir``, so the common mistake (rerunning the
+    same command and forgetting ``--resume``) fails loudly instead of quietly
+    corrupting checkpoint history. ModelMix's per-task output directories should
+    each be checked with a separate call.
+    """
+    output_dir = Path(output_dir)
+    if resume:
+        return
+    existing = [name for name in checkpoint_names if (output_dir / name).is_file()]
+    if existing:
+        raise ValueError(
+            "{} already contains {} from a previous run, but this run was not "
+            "started with --resume. A fresh run resets best_score to -inf and "
+            "would silently overwrite that checkpoint with a possibly worse one. "
+            "Pass --resume <path> to continue training in this directory, or use "
+            "a new, unused --output_dir for a fresh run.".format(
+                output_dir, " and ".join(existing)
+            )
+        )

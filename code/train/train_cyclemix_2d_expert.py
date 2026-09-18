@@ -38,6 +38,7 @@ from train.common_2d import validate_2d  # noqa: E402
 from train.common_3d import (  # noqa: E402
     atomic_torch_save,
     checkpoint_due,
+    guard_fresh_output_dir,
     seed_everything,
     seed_worker,
 )
@@ -188,6 +189,7 @@ def train(args):
         args.output_dir or REPO_ROOT / "checkpoints" / "ExpertScribble_CycleMix" / args.dataset
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    guard_fresh_output_dir(output_dir, args.resume)
     configure_logging(output_dir)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.amp and device.type != "cuda":

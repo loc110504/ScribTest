@@ -270,6 +270,27 @@ def atomic_torch_save(payload, path):
     os.replace(temporary, path)
 
 
+def guard_fresh_output_dir(output_dir, resume, checkpoint_names=("best.pth", "last.pth")):
+    """Refuse a fresh (non-``--resume``) run into an ``output_dir`` that already
+    holds a checkpoint from a previous run -- see ``train.common_3d`` (this
+    script predates that shared module and keeps its own copy of this logic,
+    matching its existing local ``atomic_torch_save``/``checkpoint_due``)."""
+    output_dir = Path(output_dir)
+    if resume:
+        return
+    existing = [name for name in checkpoint_names if (output_dir / name).is_file()]
+    if existing:
+        raise ValueError(
+            "{} already contains {} from a previous run, but this run was not "
+            "started with --resume. A fresh run resets best_score to -inf and "
+            "would silently overwrite that checkpoint with a possibly worse one. "
+            "Pass --resume <path> to continue training in this directory, or use "
+            "a new, unused --output_dir for a fresh run.".format(
+                output_dir, " and ".join(existing)
+            )
+        )
+
+
 def checkpoint_payload(model, optimizer, scaler, args, split, step, best_score):
     return {
         "schema_version": 1,
@@ -332,6 +353,7 @@ def train(args):
         or REPO_ROOT / "checkpoints" / "ScribbleBench_pCE" / args.dataset
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    guard_fresh_output_dir(output_dir, args.resume)
     configure_logging(output_dir)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
