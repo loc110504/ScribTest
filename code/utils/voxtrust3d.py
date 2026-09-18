@@ -20,6 +20,23 @@ student is allowed to learn from:
 4.  only unlabeled voxels that clear the calibrated threshold receive a soft
     teacher target (Sec. 4.5, Eq. 16-17).
 
+Trust-Advantage EMA (TA-EMA, this project's own extension, not part of the
+base paper): points 1-4 above are all *teacher -> student* trust control
+(which pseudo-labels the student may learn from). The EMA teacher update
+itself (``theta_T <- alpha*theta_T + (1-alpha)*theta_S``) is the opposite
+direction, *student -> teacher*, and a fixed ``alpha`` implicitly treats
+every student iterate as equally trustworthy. TA-EMA spends the same
+``Omega_cal`` evidence a second way -- non-gradient, exactly like point
+3 above -- to compare the student's and the teacher's calibrated accuracy on
+held-out scribble voxels and throttle the EMA update rate whenever the
+student does not show a positive trust advantage. See
+``RollingAccuracyBuffer``/``trust_advantage_alpha`` below and
+``train/train_voxtrust3d_3d.py``'s ``voxtrust_step`` for how it is wired in.
+Consequently ``Omega_cal`` is not used for gradient-based optimization
+anywhere in this module, but it does now influence the parameter trajectory
+indirectly through this non-gradient EMA gate, not only through the
+teacher/pseudo-label machinery of points 1-4.
+
 This module intentionally has no dataset/I-O code; see
 ``train/train_voxtrust3d_3d.py`` for the training loop that wires these
 pieces to ``dataloader.scribblebench_3d.ScribbleBench3DDataset``.
@@ -553,6 +570,153 @@ class RollingCalibrationBuffer:
         self.class_only = {
             int(key): deque(records, maxlen=self.buffer_size) for key, records in state["class_only"].items()
         }
+
+
+# ---------------------------------------------------------------------------
+# Trust-Advantage EMA (TA-EMA): bidirectional trust control's student ->
+# teacher half. Uses the same Omega_cal evidence as Sec. 4.3-4.4, but grouped
+# by each calibration voxel's *true* scribble class and its distance to
+# Omega_sup of that *same true* class -- not the teacher-predicted class/
+# distance RollingCalibrationBuffer above uses -- because this is a
+# student-vs-teacher comparison and both models must be scored on the
+# identical subset; grouping by a prediction (which student and teacher can
+# disagree on) would score them on two different subsets. Every calibration
+# voxel's true class always has an Omega_sup entry in the same volume/slice
+# (spatially_blocked_partition never holds out a class's last block, see its
+# and fit_distance_bins' docstrings), so this distance is always defined.
+# ---------------------------------------------------------------------------
+
+
+def bin_distance_by_class(distance, class_ids, edges):
+    """Per-row distance-stratum lookup with a per-row class id (vs.
+    ``assign_distance_stratum``'s single shared class).
+
+    Unlike the pseudo-label acceptance path (``build_pseudo_targets``), this
+    has no ``d_max`` "reject rather than extrapolate" cutoff: it only buckets
+    an already-known-correct/incorrect observation for a coarse Wilson-bound
+    accuracy estimate, not a novel unlabeled prediction, so extrapolating
+    into the outermost stratum for an out-of-range distance is acceptable.
+
+    Args:
+        distance: ``(N,)`` float array.
+        class_ids: ``(N,)`` int array, values in ``[0, edges.shape[0])``.
+        edges: ``(num_classes, num_strata - 1)`` array (see
+            ``fit_distance_bins``); ``edges.shape[1] == 0`` means one stratum.
+    Returns:
+        ``(N,)`` int64 array in ``[0, num_strata - 1]``.
+    """
+    class_ids = np.asarray(class_ids)
+    distance = np.asarray(distance, dtype=np.float64)
+    if edges.shape[1] == 0:
+        return np.zeros(len(class_ids), dtype=np.int64)
+    local_edges = edges[class_ids]
+    return (distance[:, None] >= local_edges).sum(axis=1).astype(np.int64)
+
+
+class RollingAccuracyBuffer:
+    """Rolling per-(true class, true-distance-stratum) correctness counts for
+    one model (student or teacher), used only to estimate ``Q_m`` below.
+
+    Lighter than ``RollingCalibrationBuffer``: TA-EMA only ever needs a
+    Wilson lower-confidence bound on raw accuracy, not a fitted acceptance
+    threshold over a reliability grid, so this stores 0/1 correctness only.
+    It also does not cap one spatial block's contribution per update the way
+    ``RollingCalibrationBuffer.update`` does -- ``Q_m`` is a single coarse
+    per-stratum average, not a fine-grained fitted threshold, so occasional
+    over-representation of one stroke has a bounded effect; add the same
+    ``block_cap`` capping here if that proves too noisy in practice.
+    """
+
+    def __init__(self, num_classes, num_strata, buffer_size=4096):
+        if num_classes < 1 or num_strata < 1:
+            raise ValueError("num_classes and num_strata must be positive")
+        if buffer_size < 1:
+            raise ValueError("buffer_size must be positive")
+        self.num_classes = num_classes
+        self.num_strata = num_strata
+        self.buffer_size = buffer_size
+        self.cells = {}
+
+    def _cell(self, class_id, bin_id):
+        key = (int(class_id), int(bin_id))
+        buffer = self.cells.get(key)
+        if buffer is None:
+            buffer = deque(maxlen=self.buffer_size)
+            self.cells[key] = buffer
+        return buffer
+
+    def update(self, class_ids, bin_ids, corrects):
+        class_ids = np.asarray(class_ids)
+        bin_ids = np.asarray(bin_ids)
+        corrects = np.asarray(corrects, dtype=np.float64)
+        n = len(class_ids)
+        if len({n, len(bin_ids), len(corrects)}) != 1:
+            raise ValueError("update() arrays must all have the same length")
+        for i in range(n):
+            self._cell(class_ids[i], bin_ids[i]).append(float(corrects[i]))
+
+    def quality(self, n_min, delta):
+        """``Q_m``: the mean Wilson LCB over (class, stratum) cells with at
+        least ``n_min`` observations; ``None`` if no cell yet qualifies (the
+        caller should fall back to a fixed EMA rate in that case)."""
+        supported = []
+        for buffer in self.cells.values():
+            n = len(buffer)
+            if n < n_min:
+                continue
+            p_hat = sum(buffer) / n
+            supported.append(wilson_lower_bound(p_hat, n, delta))
+        if not supported:
+            return None
+        return float(np.mean(supported))
+
+    def state_dict(self):
+        return {
+            "num_classes": self.num_classes,
+            "num_strata": self.num_strata,
+            "buffer_size": self.buffer_size,
+            "cells": {key: list(buffer) for key, buffer in self.cells.items()},
+        }
+
+    def load_state_dict(self, state):
+        if state["num_classes"] != self.num_classes or state["num_strata"] != self.num_strata:
+            raise ValueError("checkpoint accuracy-buffer shape does not match this run's configuration")
+        self.buffer_size = state["buffer_size"]
+        self.cells = {
+            tuple(key): deque(records, maxlen=self.buffer_size) for key, records in state["cells"].items()
+        }
+
+
+def trust_advantage_alpha(ema_decay, q_student, q_teacher, min_scale=0.1):
+    """TA-EMA blend rate: the ``alpha_t`` such that
+    ``theta_T <- alpha_t*theta_T + (1-alpha_t)*theta_S`` reproduces
+    ``eta_t = (1-ema_decay) * Q_S^t * scale``, ``scale=1`` if
+    ``Q_S^t > Q_T^t`` else ``min_scale``.
+
+    Falls back to the fixed ``ema_decay`` (standard EMA, ``scale`` effectively
+    irrelevant) whenever either quality estimate is unavailable -- warm-up,
+    or no (class, stratum) cell has enough calibration evidence yet.
+
+    ``min_scale`` is a deliberate departure from a hard freeze
+    (``scale=0``) whenever the student lacks a trust advantage: an EMA
+    teacher is a smoothed average of past students, so by construction it
+    routinely scores at least as well as any single recent student iterate
+    on this same held-out evidence, which would make a strict
+    admit/freeze gate stall the teacher for long stretches of training
+    rather than only during genuinely bad student iterates. ``min_scale``
+    keeps the mechanism able to only *slow*, never *reverse*, the baseline
+    EMA rate (``0 < alpha_t <= 1``, i.e. ``eta_t`` is always in
+    ``[0, 1 - ema_decay]``), while guaranteeing the teacher keeps absorbing
+    some signal from the student even when calibrated evidence favors the
+    teacher.
+    """
+    if q_student is None or q_teacher is None:
+        return ema_decay
+    if not 0.0 <= min_scale <= 1.0:
+        raise ValueError("min_scale must be in [0, 1]")
+    scale = 1.0 if q_student > q_teacher else min_scale
+    eta = (1.0 - ema_decay) * q_student * scale
+    return 1.0 - eta
 
 
 # ---------------------------------------------------------------------------

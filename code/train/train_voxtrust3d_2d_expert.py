@@ -14,6 +14,11 @@ all to serve this dataset source -- see
 Per Mean Teacher's "only one EMA network is required at inference", the
 deployed/checkpointed model is the EMA teacher, so
 ``code/test/test_pce_2d_expert.py`` evaluates ``best.pth`` directly.
+
+Trust-Advantage EMA (``--ta_ema``, this project's own extension to the base
+paper) is wired in identically to ``train_voxtrust3d_2d.py``/
+``train_voxtrust3d_3d.py`` -- see the latter's module docstring and
+``utils.voxtrust3d.trust_advantage_alpha`` for the mechanism.
 """
 
 import argparse
@@ -46,6 +51,7 @@ from train.train_voxtrust3d_3d import voxtrust_step  # noqa: E402
 from utils.ema_optim import WeightEMA  # noqa: E402
 from utils.ramps import sigmoid_rampup  # noqa: E402
 from utils.voxtrust3d import (  # noqa: E402
+    RollingAccuracyBuffer,
     RollingCalibrationBuffer,
     build_class_trees,
     fit_distance_bins,
@@ -93,6 +99,14 @@ def parse_args():
     parser.add_argument("--resume", default=None)
 
     parser.add_argument("--ema_decay", type=float, default=0.99)
+    parser.add_argument(
+        "--ta_ema", type=int, default=1, choices=[0, 1],
+        help="gate the EMA teacher update by calibrated student-vs-teacher trust advantage (else fixed ema_decay)",
+    )
+    parser.add_argument(
+        "--ta_ema_min_scale", type=float, default=0.1,
+        help="floor scale applied to the EMA update rate when the student lacks a calibrated trust advantage",
+    )
     parser.add_argument("--holdout_fraction", type=float, default=0.15, help="eta")
     parser.add_argument("--distance_strata", type=int, default=3, help="B")
     parser.add_argument("--target_precision", type=float, default=0.95, help="rho")
@@ -139,6 +153,8 @@ def validate_args(args):
         raise ValueError("late_phase_start must be non-negative")
     if not 0 < args.ema_decay < 1:
         raise ValueError("ema_decay must satisfy 0 < alpha < 1")
+    if not 0.0 <= args.ta_ema_min_scale <= 1.0:
+        raise ValueError("ta_ema_min_scale must be in [0, 1]")
     if not 0.0 < args.holdout_fraction < 1.0:
         raise ValueError("holdout_fraction must satisfy 0 < eta < 1")
     if args.distance_strata < 1:
@@ -166,7 +182,10 @@ def create_model(num_classes, feature_channels, device):
     return UNet2D(in_chns=1, class_num=num_classes, feature_chns=feature_channels).to(device)
 
 
-def checkpoint_payload(model, model_ema, optimizer, scaler, calibrator, args, split, step, best_score):
+def checkpoint_payload(
+    model, model_ema, optimizer, scaler, calibrator, args, split, step, best_score,
+    student_quality=None, teacher_quality=None,
+):
     return {
         "schema_version": 1,
         "model_name": "unet_2d",
@@ -190,12 +209,17 @@ def checkpoint_payload(model, model_ema, optimizer, scaler, calibrator, args, sp
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "calibrator_state": calibrator.state_dict(),
+        "ta_ema_student_state": student_quality.state_dict() if student_quality is not None else None,
+        "ta_ema_teacher_state": teacher_quality.state_dict() if teacher_quality is not None else None,
         "split": split,
         "args": vars(args),
     }
 
 
-def restore_checkpoint(path, model, model_ema, optimizer, scaler, calibrator, args, split):
+def restore_checkpoint(
+    path, model, model_ema, optimizer, scaler, calibrator, args, split,
+    student_quality=None, teacher_quality=None,
+):
     checkpoint = torch.load(path, map_location="cpu")
     expected_model = checkpoint.get("model_config", {})
     expected_data = checkpoint.get("data_config", {})
@@ -211,6 +235,10 @@ def restore_checkpoint(path, model, model_ema, optimizer, scaler, calibrator, ar
     scaler.load_state_dict(checkpoint.get("scaler_state_dict", {}))
     if checkpoint.get("calibrator_state") is not None:
         calibrator.load_state_dict(checkpoint["calibrator_state"])
+    if student_quality is not None and checkpoint.get("ta_ema_student_state") is not None:
+        student_quality.load_state_dict(checkpoint["ta_ema_student_state"])
+    if teacher_quality is not None and checkpoint.get("ta_ema_teacher_state") is not None:
+        teacher_quality.load_state_dict(checkpoint["ta_ema_teacher_state"])
     return int(checkpoint["global_step"]), float(checkpoint["best_val_mean_dice"])
 
 
@@ -312,11 +340,20 @@ def train(args):
         rng=np.random.default_rng(stable_seed(args.seed, "calibrator")),
     )
     grid = np.linspace(0.0, 1.0, args.score_grid_points)
+    student_quality = (
+        RollingAccuracyBuffer(num_classes, args.distance_strata, args.calibration_buffer_size)
+        if args.ta_ema else None
+    )
+    teacher_quality = (
+        RollingAccuracyBuffer(num_classes, args.distance_strata, args.calibration_buffer_size)
+        if args.ta_ema else None
+    )
 
     step, best_score = 0, -math.inf
     if args.resume:
         step, best_score = restore_checkpoint(
-            args.resume, model, model_ema, optimizer, scaler, calibrator, args, split
+            args.resume, model, model_ema, optimizer, scaler, calibrator, args, split,
+            student_quality=student_quality, teacher_quality=teacher_quality,
         )
         logging.info("Resumed %s at iteration %d", args.resume, step)
         if step >= args.max_iterations:
@@ -352,6 +389,7 @@ def train(args):
                     loss_scrib, loss_pl, diagnostics = voxtrust_step(
                         model, model_ema, batch, device, ignore_index, num_classes,
                         case_trees, edges_t, d_max_t, calibrator, grid, args, calibration_active,
+                        student_quality=student_quality, teacher_quality=teacher_quality,
                         augment_fn=strong_intensity_augment_2d,
                     )
                     pseudo_weight = (
@@ -363,7 +401,7 @@ def train(args):
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                ema_optimizer.step()
+                ema_optimizer.step(alpha=diagnostics["ema_alpha"])
                 step += 1
 
                 writer.add_scalar("train/total", loss.item(), step)
@@ -407,7 +445,8 @@ def train(args):
                     if score > best_score:
                         best_score = score
                         payload = checkpoint_payload(
-                            model, model_ema, optimizer, scaler, calibrator, args, split, step, best_score
+                            model, model_ema, optimizer, scaler, calibrator, args, split, step, best_score,
+                            student_quality=student_quality, teacher_quality=teacher_quality,
                         )
                         atomic_torch_save(payload, output_dir / "best.pth")
                         logging.info("Saved best.pth: iteration=%d mean_dice=%.6f", step, score)
@@ -417,7 +456,8 @@ def train(args):
                     model_ema.train()
                     atomic_torch_save(
                         checkpoint_payload(
-                            model, model_ema, optimizer, scaler, calibrator, args, split, step, best_score
+                            model, model_ema, optimizer, scaler, calibrator, args, split, step, best_score,
+                            student_quality=student_quality, teacher_quality=teacher_quality,
                         ),
                         output_dir / "last.pth",
                     )

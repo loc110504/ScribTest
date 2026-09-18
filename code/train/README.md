@@ -183,6 +183,15 @@ coordinate tracking through augmentation). `voxtrust_step`
 calculation it performs is shape-agnostic; only the student's strong-view
 augmentation differs (`strong_intensity_augment_2d` vs. `_3d`).
 
+Also implements Trust-Advantage EMA (`--ta_ema`, on by default; this
+project's own extension, not part of the base paper): the same held-out
+`Omega_cal` evidence additionally gates the EMA teacher update itself
+(student -> teacher), throttling the update rate whenever the student's
+calibrated accuracy on held-out scribble voxels does not exceed the
+teacher's own, instead of absorbing every student iterate at a fixed rate.
+See `utils.voxtrust3d.trust_advantage_alpha`/`RollingAccuracyBuffer` for the
+mechanism and why it floors rather than hard-freezes the update rate.
+
 The 3D pipeline crops a fixed-size patch out of each (much larger) WORD
 volume, so Omega_sup/Omega_cal calibration is partitioned once **per case**
 and unlabeled-voxel coordinates are tracked through that crop

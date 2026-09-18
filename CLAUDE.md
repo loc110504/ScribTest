@@ -21,7 +21,14 @@ loss / pseudo-label:
   the student learns from; see `code/utils/voxtrust3d.py` and the `train_voxtrust3d_2d.py` /
   `train_voxtrust3d_3d.py` module docstrings for the algorithm and the implementation choices made
   where the paper leaves details open (block/KD-tree granularity differs between the 2D per-slice
-  and 3D per-volume pipelines — see the 2D script's docstring)
+  and 3D per-volume pipelines — see the 2D script's docstring). Also implements Trust-Advantage EMA
+  (`--ta_ema`, on by default; this project's own extension, not part of the base paper): the same
+  held-out `Omega_cal` evidence additionally gates the EMA teacher update itself
+  (student → teacher), throttling — never fully freezing, to avoid stalling the teacher for long
+  stretches the way a strict admit/reject gate would — the update rate whenever the student's
+  calibrated accuracy on held-out scribble voxels does not exceed the teacher's own, instead of
+  absorbing every student iterate at a fixed rate; see `trust_advantage_alpha`/
+  `RollingAccuracyBuffer` in `code/utils/voxtrust3d.py`
 - **EFFDNet** (Liu et al., MICCAI 2025) — Mean Teacher + a grid-based Foreground-Background
   Separation Loss (FBSL, a modified SupCon-style contrastive loss) and a Foreground Augmentation
   with Diverse Context (FADC) copy-paste augmentation; see `code/utils/effdnet.py`. Runs on all 3

@@ -14,9 +14,11 @@ if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 from utils.voxtrust3d import (
+    RollingAccuracyBuffer,
     RollingCalibrationBuffer,
     assign_scribble_blocks,
     batch_transfer_distance,
+    bin_distance_by_class,
     build_class_trees,
     build_patch_coordinates,
     build_pseudo_targets,
@@ -33,6 +35,7 @@ from utils.voxtrust3d import (
     stable_seed,
     strong_intensity_augment_2d,
     strong_intensity_augment_3d,
+    trust_advantage_alpha,
     wilson_lower_bound,
 )
 
@@ -329,6 +332,109 @@ class RollingCalibrationBufferTests(unittest.TestCase):
         restored.load_state_dict(state)
         self.assertEqual(list(restored._bin_buffer(0, 0)), list(buffer._bin_buffer(0, 0)))
         self.assertEqual(list(restored._class_buffer(1)), list(buffer._class_buffer(1)))
+
+
+class BinDistanceByClassTests(unittest.TestCase):
+    def test_matches_per_row_searchsorted(self):
+        edges = np.array([[1.0, 2.0], [4.0, 5.0]])  # 2 classes, 3 strata each
+        distance = np.array([0.5, 1.5, 2.5, 3.5, 6.0])
+        class_ids = np.array([0, 0, 0, 1, 1])
+        bins = bin_distance_by_class(distance, class_ids, edges)
+        np.testing.assert_array_equal(bins, [0, 1, 2, 0, 2])
+
+    def test_single_stratum_is_always_bin_zero(self):
+        edges = np.zeros((2, 0))
+        bins = bin_distance_by_class(np.array([0.0, 100.0]), np.array([0, 1]), edges)
+        np.testing.assert_array_equal(bins, [0, 0])
+
+    def test_no_dmax_cutoff_extrapolates_into_outermost_stratum(self):
+        # Unlike build_pseudo_targets, there is no d_max rejection here.
+        edges = np.array([[1.0, 2.0]])
+        bins = bin_distance_by_class(np.array([1000.0]), np.array([0]), edges)
+        self.assertEqual(bins[0], 2)
+
+
+class RollingAccuracyBufferTests(unittest.TestCase):
+    def test_quality_is_none_below_min_samples(self):
+        buffer = RollingAccuracyBuffer(num_classes=2, num_strata=2, buffer_size=100)
+        buffer.update(np.array([0]), np.array([0]), np.array([1.0]))
+        self.assertIsNone(buffer.quality(n_min=5, delta=0.05))
+
+    def test_quality_matches_wilson_lower_bound_once_supported(self):
+        buffer = RollingAccuracyBuffer(num_classes=1, num_strata=1, buffer_size=100)
+        corrects = np.array([1.0] * 9 + [0.0])  # 9/10 correct
+        buffer.update(np.zeros(10, dtype=np.int64), np.zeros(10, dtype=np.int64), corrects)
+        expected = wilson_lower_bound(0.9, 10, 0.05)
+        self.assertAlmostEqual(buffer.quality(n_min=10, delta=0.05), float(expected), places=6)
+
+    def test_quality_averages_only_supported_strata(self):
+        buffer = RollingAccuracyBuffer(num_classes=2, num_strata=1, buffer_size=100)
+        # class 0: 10 observations (supported); class 1: 2 observations (not supported).
+        buffer.update(np.zeros(10, dtype=np.int64), np.zeros(10, dtype=np.int64), np.ones(10))
+        buffer.update(np.array([1, 1]), np.array([0, 0]), np.array([0.0, 0.0]))
+        expected = wilson_lower_bound(1.0, 10, 0.05)
+        self.assertAlmostEqual(buffer.quality(n_min=5, delta=0.05), float(expected), places=6)
+
+    def test_fifo_eviction_at_buffer_size(self):
+        buffer = RollingAccuracyBuffer(num_classes=1, num_strata=1, buffer_size=3)
+        for value in [1.0, 1.0, 1.0, 0.0, 0.0]:
+            buffer.update(np.array([0]), np.array([0]), np.array([value]))
+        self.assertEqual(len(buffer.cells[(0, 0)]), 3)
+        self.assertEqual(list(buffer.cells[(0, 0)]), [1.0, 0.0, 0.0])
+
+    def test_state_dict_round_trip(self):
+        buffer = RollingAccuracyBuffer(num_classes=2, num_strata=2, buffer_size=10)
+        buffer.update(np.array([0, 1]), np.array([0, 1]), np.array([1.0, 0.0]))
+        restored = RollingAccuracyBuffer(num_classes=2, num_strata=2, buffer_size=10)
+        restored.load_state_dict(buffer.state_dict())
+        self.assertEqual(list(restored.cells[(0, 0)]), list(buffer.cells[(0, 0)]))
+        self.assertEqual(list(restored.cells[(1, 1)]), list(buffer.cells[(1, 1)]))
+
+    def test_load_state_dict_rejects_shape_mismatch(self):
+        buffer = RollingAccuracyBuffer(num_classes=2, num_strata=2, buffer_size=10)
+        state = buffer.state_dict()
+        mismatched = RollingAccuracyBuffer(num_classes=3, num_strata=2, buffer_size=10)
+        with self.assertRaises(ValueError):
+            mismatched.load_state_dict(state)
+
+
+class TrustAdvantageAlphaTests(unittest.TestCase):
+    def test_falls_back_to_fixed_ema_when_evidence_missing(self):
+        self.assertEqual(trust_advantage_alpha(0.99, None, 0.8), 0.99)
+        self.assertEqual(trust_advantage_alpha(0.99, 0.8, None), 0.99)
+        self.assertEqual(trust_advantage_alpha(0.99, None, None), 0.99)
+
+    def test_student_advantage_uses_full_rate(self):
+        # Q_S=0.95 > Q_T=0.80 -> eta = (1-0.99)*0.95 = 0.0095 -> alpha = 0.9905.
+        alpha = trust_advantage_alpha(0.99, q_student=0.95, q_teacher=0.80, min_scale=0.1)
+        self.assertAlmostEqual(alpha, 1.0 - 0.01 * 0.95, places=8)
+
+    def test_no_advantage_is_throttled_not_frozen(self):
+        # Q_S=0.70 <= Q_T=0.90 -> eta = (1-0.99)*0.70*0.1 = 0.0007 -> alpha = 0.9993.
+        alpha = trust_advantage_alpha(0.99, q_student=0.70, q_teacher=0.90, min_scale=0.1)
+        self.assertAlmostEqual(alpha, 1.0 - 0.01 * 0.70 * 0.1, places=8)
+        self.assertLess(alpha, 1.0)  # never a hard freeze (alpha < 1) as long as min_scale > 0
+
+    def test_tie_is_treated_as_no_advantage(self):
+        advantage_alpha = trust_advantage_alpha(0.99, 0.8, 0.8, min_scale=0.1)
+        no_advantage_alpha = trust_advantage_alpha(0.99, 0.8, 0.80000001, min_scale=0.1)
+        self.assertAlmostEqual(advantage_alpha, no_advantage_alpha, places=6)
+
+    def test_min_scale_zero_reproduces_a_hard_freeze(self):
+        alpha = trust_advantage_alpha(0.99, q_student=0.1, q_teacher=0.9, min_scale=0.0)
+        self.assertEqual(alpha, 1.0)  # eta = 0 -> teacher frozen this step
+
+    def test_alpha_never_drops_below_ema_decay(self):
+        # eta_t in [0, 1-ema_decay] for any q_student in [0, 1] and any scale in [0, 1].
+        for q_student in np.linspace(0.0, 1.0, 6):
+            for q_teacher in np.linspace(0.0, 1.0, 6):
+                alpha = trust_advantage_alpha(0.99, float(q_student), float(q_teacher), min_scale=0.1)
+                self.assertGreaterEqual(alpha, 0.99 - 1e-9)
+                self.assertLessEqual(alpha, 1.0 + 1e-9)
+
+    def test_rejects_min_scale_out_of_range(self):
+        with self.assertRaises(ValueError):
+            trust_advantage_alpha(0.99, 0.9, 0.5, min_scale=1.5)
 
 
 class BuildPseudoTargetsTests(unittest.TestCase):

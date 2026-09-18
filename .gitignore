@@ -32,6 +32,8 @@ papers/
 # Project-specific (existing)
 LED_SDT_specs/
 AGENTS.md
+ISBI-Skills/
+paper_icassp2027/
 
 # Editor/OS
 .vscode/
