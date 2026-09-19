@@ -1,6 +1,10 @@
-"""Test VNet3D checkpoints (pCE/CycleMix/SDT-Net/VoxTrust-3D) on WORD's
-official ScribbleBench test split. ACDC/MSCMR checkpoints are evaluated by
-``test_pce_2d.py`` instead.
+"""Test VNet3D checkpoints (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet)
+on WORD's official ScribbleBench test split. ACDC/MSCMR checkpoints are
+evaluated by ``test_pce_2d.py`` instead.
+
+``--eval_target`` (default ``student``): see ``test_pce_2d.py``'s module
+docstring -- the same convention and ``select_eval_state_dict`` logic apply
+here.
 """
 
 import argparse
@@ -44,7 +48,37 @@ def parse_args():
     parser.add_argument("--temp_dir", default=None)
     parser.add_argument("--case_limit", type=int, default=None)
     parser.add_argument("--save_predictions", action="store_true")
+    parser.add_argument(
+        "--eval_target", default="student", choices=["student", "teacher"],
+        help=(
+            "For a Mean-Teacher checkpoint (VoxTrust-3D): which weights to evaluate. "
+            "'student' (default) is the network trained directly by backprop. 'teacher' is "
+            "the EMA teacher -- VoxTrust-3D's historical default before this option "
+            "existed. Ignored (always the single available model) for checkpoints with no "
+            "EMA teacher (pCE/CycleMix/SDT-Net); EFFDNet already stores its student under "
+            "model_state_dict regardless of this flag."
+        ),
+    )
     return parser.parse_args()
+
+
+def select_eval_state_dict(checkpoint, eval_target):
+    """Resolve which weights ``--eval_target`` refers to (see module docstring
+    and ``test_pce_2d.py``'s twin function for the full per-method mapping)."""
+    has_student_key = "student_state_dict" in checkpoint
+    has_ema_key = "ema_state_dict" in checkpoint
+    if eval_target == "student":
+        if has_student_key:
+            return checkpoint["student_state_dict"]
+        return checkpoint["model_state_dict"]
+    if has_student_key:
+        return checkpoint["model_state_dict"]
+    if has_ema_key:
+        return checkpoint["ema_state_dict"]
+    raise ValueError(
+        "checkpoint has no EMA teacher (pCE/CycleMix/SDT-Net checkpoints look like this); "
+        "--eval_target teacher is not applicable"
+    )
 
 
 def save_prediction(prediction_dhw, image_path, output_path):
@@ -103,7 +137,7 @@ def evaluate(args):
         class_num=model_config["class_num"],
         n_filters=model_config["n_filters"],
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.load_state_dict(select_eval_state_dict(checkpoint, args.eval_target), strict=True)
     model.eval()
 
     output_dir = Path(
@@ -143,6 +177,7 @@ def evaluate(args):
         "checkpoint": str(checkpoint_path),
         "dataset": dataset_name,
         "patch_size_dhw": list(patch_size),
+        "eval_target": args.eval_target,
         "summary": summary,
         "cases": cases,
     }
@@ -159,7 +194,8 @@ def evaluate(args):
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(json_safe(payload), handle, indent=2, allow_nan=False)
     print(
-        "ScribbleBench mean Dice: {:.6f} | HD95: {:.4f} mm | ASSD: {:.4f} mm".format(
+        "ScribbleBench mean Dice (target={}): {:.6f} | HD95: {:.4f} mm | ASSD: {:.4f} mm".format(
+            args.eval_target,
             summary["scribblebench_mean_dice"],
             summary["scribblebench_mean_hd95"],
             summary["scribblebench_mean_assd"],

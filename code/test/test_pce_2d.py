@@ -1,11 +1,22 @@
-"""Test UNet2D checkpoints (pCE/CycleMix/SDT-Net/VoxTrust-3D) on the official
-ScribbleBench ACDC/MSCMR test split.
+"""Test UNet2D checkpoints (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/
+ModelMix) on the official ScribbleBench ACDC/MSCMR test split.
 
 Per-slice resize-then-stitch inference (``train.common_2d.predict_volume_2d``,
 matching WSL4MIS/DMSPS's ``val_2D.py`` pattern), scored with the same,
 dimension-agnostic ``metrics_3d.py`` used by the 3D evaluator -- so results
 are directly comparable across the 2D ACDC/MSCMR and 3D WORD pipelines and
 ``append_metrics_csv.py`` needs no changes.
+
+``--eval_target`` (default ``student``): for VoxTrust-3D, the only
+Mean-Teacher method here, the checkpoint carries both the EMA teacher and
+the student; it is now evaluated by the **student** by default -- the
+network gradient descent actually trained -- rather than the teacher (pass
+``--eval_target teacher`` to recover the old, paper-faithful "only the EMA
+teacher is deployed at inference" number). pCE/CycleMix/SDT-Net/ModelMix
+have no teacher at all, and EFFDNet already stores its student under
+``model_state_dict``; ``select_eval_state_dict`` below resolves all of these
+checkpoint shapes uniformly. See ``train_voxtrust3d_2d.py``'s module
+docstring for the full rationale.
 """
 
 import argparse
@@ -45,7 +56,42 @@ def parse_args():
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--case_limit", type=int, default=None)
     parser.add_argument("--save_predictions", action="store_true")
+    parser.add_argument(
+        "--eval_target", default="student", choices=["student", "teacher"],
+        help=(
+            "For a Mean-Teacher checkpoint (VoxTrust-3D): which weights to evaluate. "
+            "'student' (default) is the network trained directly by backprop. 'teacher' is "
+            "the EMA teacher -- VoxTrust-3D's historical default before this option "
+            "existed. Ignored (always the single available model) for checkpoints with no "
+            "EMA teacher (pCE/CycleMix/SDT-Net/ModelMix); EFFDNet already stores its student "
+            "under model_state_dict regardless of this flag."
+        ),
+    )
     return parser.parse_args()
+
+
+def select_eval_state_dict(checkpoint, eval_target):
+    """Resolve which weights ``--eval_target`` refers to, across every
+    checkpoint shape this evaluator sees (see module docstring).
+
+    - VoxTrust-3D: ``model_state_dict`` = teacher, ``student_state_dict`` = student.
+    - EFFDNet: ``model_state_dict`` = student (already), ``ema_state_dict`` = teacher.
+    - pCE/CycleMix/SDT-Net/ModelMix: ``model_state_dict`` is the only model (no teacher).
+    """
+    has_student_key = "student_state_dict" in checkpoint
+    has_ema_key = "ema_state_dict" in checkpoint
+    if eval_target == "student":
+        if has_student_key:
+            return checkpoint["student_state_dict"]
+        return checkpoint["model_state_dict"]
+    if has_student_key:
+        return checkpoint["model_state_dict"]
+    if has_ema_key:
+        return checkpoint["ema_state_dict"]
+    raise ValueError(
+        "checkpoint has no EMA teacher (pCE/CycleMix/SDT-Net/ModelMix checkpoints look like "
+        "this); --eval_target teacher is not applicable"
+    )
 
 
 def save_prediction(prediction_dhw, image_path, output_path):
@@ -94,7 +140,7 @@ def evaluate(args):
         class_num=model_config["class_num"],
         feature_chns=tuple(model_config["feature_chns"]),
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.load_state_dict(select_eval_state_dict(checkpoint, args.eval_target), strict=True)
     model.eval()
 
     output_dir = Path(args.output_dir or REPO_ROOT / "results" / "ScribbleBench_pCE" / dataset_name).resolve()
@@ -117,6 +163,7 @@ def evaluate(args):
         "checkpoint": str(checkpoint_path),
         "dataset": dataset_name,
         "patch_size_hw": list(patch_size),
+        "eval_target": args.eval_target,
         "summary": summary,
         "cases": cases,
     }
@@ -133,7 +180,8 @@ def evaluate(args):
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(json_safe(payload), handle, indent=2, allow_nan=False)
     print(
-        "ScribbleBench mean Dice: {:.6f} | HD95: {:.4f} mm | ASSD: {:.4f} mm".format(
+        "ScribbleBench mean Dice (target={}): {:.6f} | HD95: {:.4f} mm | ASSD: {:.4f} mm".format(
+            args.eval_target,
             summary["scribblebench_mean_dice"], summary["scribblebench_mean_hd95"], summary["scribblebench_mean_assd"]
         )
     )

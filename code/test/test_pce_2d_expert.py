@@ -1,4 +1,4 @@
-"""Test UNet2D checkpoints (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/SC-MT/
+"""Test UNet2D checkpoints (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/
 ModelMix) trained on the expert-scribble ACDC/MSCMR archive, on that same
 archive's own held-out test patients/subjects.
 

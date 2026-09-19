@@ -27,14 +27,32 @@ scribble voxels does not exceed the teacher's own. See
 mechanism and ``voxtrust_step`` below for how it composes with the
 pseudo-label calibration above.
 
+``--ablation`` selects among the four arms of Table 2 in
+``paper_icassp2027/main.tex`` ("Ablating Trust Calibration"): ``full``
+(default, the method described above), ``class_only`` (held-out calibration
+without distance conditioning), ``global_confidence`` (one fixed,
+uncalibrated reliability cutoff, ``--global_confidence_threshold``), and
+``all_pseudo_labels`` (unfiltered Mean Teacher transfer). The latter two
+never consult ``Omega_cal``, so pass ``--holdout_fraction 0`` with them --
+see ``utils/voxtrust3d.py``'s module docstring and
+``code/train/run_voxtrust3d_dcc_ablation.sh`` for the sweep that reproduces
+the whole table.
+
 Only sparse labels in ``labelsTr`` (split further into Omega_sup/Omega_cal)
 contribute to optimization. Dense training labels are accessed exclusively
 for model selection on a patient-level holdout, exactly as in
-``train_pce_3d.py``. Per Sec. 5 ("only one EMA network is required at
-inference; the calibrator is removed"), the deployed/checkpointed model is
-the EMA teacher, saved in the same schema as the sibling baselines -- so
-``code/test/test_pce_3d.py`` evaluates ``best.pth`` directly, exactly like it
-already does for SDT-Net and CycleMix.
+``train_pce_3d.py``.
+
+Deployed model: the checkpoint saves BOTH nets (``model_state_dict`` = EMA
+teacher, ``student_state_dict`` = student), but model selection (which
+iteration becomes ``best.pth``) and ``code/test/test_pce_3d.py``'s default
+evaluation target are both the **student**, not the teacher -- a deliberate
+departure from Sec. 5's own protocol ("only one EMA network is required at
+inference; the calibrator is removed"), so that every baseline in this repo
+is finally judged by the network that gradient descent actually trained
+(EFFDNet/SDT-Net already deployed their student; VoxTrust-3D previously did
+not). Pass ``test_pce_3d.py --eval_target teacher`` to recover the old
+teacher-based number for comparison.
 """
 
 import argparse
@@ -82,12 +100,14 @@ from utils.voxtrust3d import (  # noqa: E402
     choose_patch_origin,
     fit_distance_bins,
     gather_patch,
+    global_threshold_pseudo_targets,
     masked_soft_ce_loss,
     random_flip_rotate,
     reliability_score,
     scatter_points_into_patch,
     spatially_blocked_partition,
     stable_seed,
+    unconditional_pseudo_targets,
     strong_intensity_augment_3d,
     trust_advantage_alpha,
 )
@@ -149,7 +169,9 @@ def parse_args():
     )
 
     # Spatially blocked scribble calibration (Sec. 4.1, Eq. 3).
-    parser.add_argument("--holdout_fraction", type=float, default=0.15, help="eta")
+    parser.add_argument(
+        "--holdout_fraction", type=float, default=0.15, help="eta; 0 disables the Omega_cal split entirely"
+    )
 
     # Class- and distance-conditioned risk calibration (Sec. 4.3-4.4, Eq. 8-15).
     parser.add_argument("--distance_strata", type=int, default=3, help="B")
@@ -159,6 +181,26 @@ def parse_args():
     parser.add_argument("--calibration_buffer_size", type=int, default=4096, help="N_max")
     parser.add_argument("--calibration_block_cap", type=int, default=64, help="m_max")
     parser.add_argument("--score_grid_points", type=int, default=101, help="|T|, grid over [0, 1]")
+
+    # Table 2 component ablation ("Ablating Trust Calibration",
+    # paper_icassp2027/main.tex). See utils/voxtrust3d.py's module docstring.
+    parser.add_argument(
+        "--ablation",
+        default="full",
+        choices=["full", "class_only", "global_confidence", "all_pseudo_labels"],
+        help=(
+            "full: proposed method (held-out calibration + distance conditioning). "
+            "class_only: held-out calibration pooled across distance strata. "
+            "global_confidence: one fixed, uncalibrated reliability cutoff "
+            "(--global_confidence_threshold), no Omega_cal. all_pseudo_labels: "
+            "unfiltered Mean Teacher transfer, no Omega_cal. Pass --holdout_fraction 0 "
+            "with the latter two, since they never consult Omega_cal."
+        ),
+    )
+    parser.add_argument(
+        "--global_confidence_threshold", type=float, default=0.75,
+        help="fixed reliability cutoff used only by --ablation global_confidence",
+    )
 
     # Warm-up / pseudo-label ramp-up (Eq. 18; Algorithm 1 lines 7-13).
     parser.add_argument(
@@ -219,8 +261,8 @@ def validate_args(args):
         raise ValueError("ema_decay must satisfy 0 < alpha < 1")
     if not 0.0 <= args.ta_ema_min_scale <= 1.0:
         raise ValueError("ta_ema_min_scale must be in [0, 1]")
-    if not 0.0 < args.holdout_fraction < 1.0:
-        raise ValueError("holdout_fraction must satisfy 0 < eta < 1")
+    if not 0.0 <= args.holdout_fraction < 1.0:
+        raise ValueError("holdout_fraction must satisfy 0 <= eta < 1")
     if args.distance_strata < 1:
         raise ValueError("distance_strata must be >= 1")
     if not 0.0 < args.target_precision <= 1.0:
@@ -233,6 +275,8 @@ def validate_args(args):
         raise ValueError("calibration_buffer_size/calibration_block_cap must be positive")
     if args.score_grid_points < 2:
         raise ValueError("score_grid_points must be >= 2")
+    if not 0.0 <= args.global_confidence_threshold <= 1.0:
+        raise ValueError("global_confidence_threshold must be in [0, 1]")
     if not 0.0 <= args.warmup_frac < 1.0:
         raise ValueError("warmup_frac must satisfy 0 <= warmup_frac < 1")
     if args.rampup_frac <= 0.0:
@@ -462,6 +506,7 @@ def voxtrust_step(
     student_quality=None,
     teacher_quality=None,
     augment_fn=strong_intensity_augment_3d,
+    ablation="full",
 ):
     """One VoxTrust-3D training iteration (Algorithm 1).
 
@@ -480,6 +525,30 @@ def voxtrust_step(
     training loop's fixed-rate EMA is unchanged. When enabled,
     ``diagnostics["ema_alpha"]`` is the caller's ``ema_optimizer.step(alpha=...)``
     rate for this iteration (see ``utils.voxtrust3d.trust_advantage_alpha``).
+
+    ``ablation`` selects one of Table 2's four arms
+    (``paper_icassp2027/main.tex``, "Ablating Trust Calibration"; see
+    ``utils/voxtrust3d.py``'s module docstring for the full description):
+
+    - ``"full"`` (default): the proposed method, unchanged from before this
+      parameter existed.
+    - ``"class_only"``: still spends ``Omega_cal`` on a Wilson-calibrated
+      threshold, but pools it across distance strata
+      (``build_pseudo_targets(..., distance_conditioning=False)``).
+    - ``"global_confidence"``: a single fixed, uncalibrated reliability
+      cutoff (``args.global_confidence_threshold``); ``Omega_cal`` is never
+      touched (the caller should train with ``--holdout_fraction 0``, so
+      ``cal_label`` is all ``ignore_index`` and this branch is reached
+      trivially).
+    - ``"all_pseudo_labels"``: unfiltered Mean Teacher pseudo-label transfer
+      (every ``Omega_u`` candidate accepted); also never touches
+      ``Omega_cal``.
+
+    The last two arms skip the transfer-distance KD-tree query, the
+    calibration-buffer update, threshold fitting, and Trust-Advantage EMA
+    entirely (there is no ``Omega_cal`` evidence for any of them to use), so
+    ``diagnostics["ema_alpha"]`` stays at the fixed ``args.ema_decay`` for
+    those two arms even when ``args.ta_ema`` is on.
     """
     weak_batch = batch["image"].to(device, non_blocking=True)
     sup_label = batch["sup_label"].to(device, non_blocking=True).long()
@@ -508,120 +577,151 @@ def voxtrust_step(
     if calibration_active:
         rel = reliability_score(student_prob, teacher_prob)
         teacher_pred = rel["teacher_pred"]
-        teacher_pred_np = teacher_pred.detach().cpu().numpy()
-
-        cal_valid = (cal_label != ignore_index).detach().cpu().numpy()
         omega_u = (sup_label == ignore_index) & (cal_label == ignore_index) & (batch["coord"][:, 0].to(device) >= 0)
-        omega_u_np = omega_u.detach().cpu().numpy()
-        candidate_np = cal_valid | omega_u_np
 
-        case_trees_batch = [case_trees[case] for case in cases]
-        distance_np = batch_transfer_distance(teacher_pred_np, coord_np, candidate_np, case_trees_batch, spacing_np)
-        distance = torch.from_numpy(distance_np).to(device)
-
-        # ---- Algorithm 1, lines 8-10: calibration update on Omega_cal ----
-        true_label_np = cal_label.detach().cpu().numpy()
-        score_np = rel["score"].detach().cpu().numpy()
-        d_max_np = d_max_t.detach().cpu().numpy()
-        edges_np = edges_t.detach().cpu().numpy()
-
-        if cal_valid.any():
-            class_ids = teacher_pred_np[cal_valid]
-            correct = (teacher_pred_np[cal_valid] == true_label_np[cal_valid]).astype(np.float64)
-            reliabilities = score_np[cal_valid]
-            block_ids = cal_block_np[cal_valid]
-            record_distance = distance_np[cal_valid]
-
-            bin_ids = np.full(len(class_ids), -1, dtype=np.int64)
-            dmax_for_class = d_max_np[class_ids]
-            use_distance = np.isfinite(record_distance) & np.isfinite(dmax_for_class)
-            within_support = use_distance & (record_distance <= dmax_for_class)
-            if edges_np.shape[1] > 0:
-                local_edges = edges_np[class_ids]
-                stratum = (record_distance[:, None] >= local_edges).sum(axis=1)
-            else:
-                stratum = np.zeros(len(class_ids), dtype=np.int64)
-            bin_ids[within_support] = stratum[within_support]
-
-            calibrator.update(
-                class_ids=class_ids,
-                bin_ids=bin_ids,
-                block_ids=block_ids,
-                reliabilities=reliabilities,
-                corrects=correct,
+        if ablation == "all_pseudo_labels":
+            # Table 2, "MT, all pseudo-labels": no Omega_cal evidence, no
+            # reliability filtering -- skip the transfer-distance query and
+            # calibration bookkeeping entirely, they would be unused.
+            pseudo = unconditional_pseudo_targets(teacher_prob, omega_u)
+            loss_pl = masked_soft_ce_loss(student_logits, pseudo["target"], pseudo["mask"])
+            diagnostics.update(
+                {
+                    "reliability_mean": rel["score"].mean().item(),
+                    "accepted_ratio": pseudo["accepted_ratio"].item(),
+                }
             )
+        elif ablation == "global_confidence":
+            # Table 2, "MT, global confidence": one fixed, uncalibrated
+            # cutoff -- likewise no Omega_cal evidence needed.
+            pseudo = global_threshold_pseudo_targets(
+                teacher_prob, omega_u, rel["score"], args.global_confidence_threshold
+            )
+            loss_pl = masked_soft_ce_loss(student_logits, pseudo["target"], pseudo["mask"])
+            diagnostics.update(
+                {
+                    "reliability_mean": rel["score"].mean().item(),
+                    "accepted_ratio": pseudo["accepted_ratio"].item(),
+                }
+            )
+        else:
+            # "full" (default) and "class_only": both spend Omega_cal on a
+            # Wilson-calibrated threshold; only build_pseudo_targets's
+            # distance_conditioning flag below differs between them.
+            teacher_pred_np = teacher_pred.detach().cpu().numpy()
 
-            # ---- Trust-Advantage EMA: student-vs-teacher accuracy on the
-            # same Omega_cal voxels, grouped by TRUE class/distance (see
-            # utils.voxtrust3d's TA-EMA section docstring for why this
-            # differs from calibrator.update's predicted-class grouping).
+            cal_valid = (cal_label != ignore_index).detach().cpu().numpy()
+            omega_u_np = omega_u.detach().cpu().numpy()
+            candidate_np = cal_valid | omega_u_np
+
+            case_trees_batch = [case_trees[case] for case in cases]
+            distance_np = batch_transfer_distance(teacher_pred_np, coord_np, candidate_np, case_trees_batch, spacing_np)
+            distance = torch.from_numpy(distance_np).to(device)
+
+            # ---- Algorithm 1, lines 8-10: calibration update on Omega_cal ----
+            true_label_np = cal_label.detach().cpu().numpy()
+            score_np = rel["score"].detach().cpu().numpy()
+            d_max_np = d_max_t.detach().cpu().numpy()
+            edges_np = edges_t.detach().cpu().numpy()
+
+            if cal_valid.any():
+                class_ids = teacher_pred_np[cal_valid]
+                correct = (teacher_pred_np[cal_valid] == true_label_np[cal_valid]).astype(np.float64)
+                reliabilities = score_np[cal_valid]
+                block_ids = cal_block_np[cal_valid]
+                record_distance = distance_np[cal_valid]
+
+                bin_ids = np.full(len(class_ids), -1, dtype=np.int64)
+                dmax_for_class = d_max_np[class_ids]
+                use_distance = np.isfinite(record_distance) & np.isfinite(dmax_for_class)
+                within_support = use_distance & (record_distance <= dmax_for_class)
+                if edges_np.shape[1] > 0:
+                    local_edges = edges_np[class_ids]
+                    stratum = (record_distance[:, None] >= local_edges).sum(axis=1)
+                else:
+                    stratum = np.zeros(len(class_ids), dtype=np.int64)
+                bin_ids[within_support] = stratum[within_support]
+
+                calibrator.update(
+                    class_ids=class_ids,
+                    bin_ids=bin_ids,
+                    block_ids=block_ids,
+                    reliabilities=reliabilities,
+                    corrects=correct,
+                )
+
+                # ---- Trust-Advantage EMA: student-vs-teacher accuracy on the
+                # same Omega_cal voxels, grouped by TRUE class/distance (see
+                # utils.voxtrust3d's TA-EMA section docstring for why this
+                # differs from calibrator.update's predicted-class grouping).
+                if ta_ema_enabled:
+                    true_classes = true_label_np[cal_valid]
+                    true_class_distance_np = batch_transfer_distance(
+                        true_label_np, coord_np, cal_valid, case_trees_batch, spacing_np
+                    )
+                    true_bin_ids = bin_distance_by_class(
+                        true_class_distance_np[cal_valid], true_classes, edges_np
+                    )
+                    # Fair comparison requires the student on the same weak view
+                    # the teacher sees, not the strong-augmented view it trains
+                    # on; eval() avoids a second, redundant BatchNorm running-
+                    # stat update from this diagnostic-only forward pass (the
+                    # real training forward on student_batch already happened
+                    # above and is unaffected by this mode toggle).
+                    was_training = model.training
+                    model.eval()
+                    with torch.no_grad():
+                        student_pred_weak_np = model(weak_batch).argmax(dim=1).detach().cpu().numpy()
+                    model.train(was_training)
+                    student_correct = (student_pred_weak_np[cal_valid] == true_classes).astype(np.float64)
+
+                    student_quality.update(true_classes, true_bin_ids, student_correct)
+                    teacher_quality.update(true_classes, true_bin_ids, correct)
+
             if ta_ema_enabled:
-                true_classes = true_label_np[cal_valid]
-                true_class_distance_np = batch_transfer_distance(
-                    true_label_np, coord_np, cal_valid, case_trees_batch, spacing_np
+                q_student = student_quality.quality(args.calibration_min_samples, args.wilson_delta)
+                q_teacher = teacher_quality.quality(args.calibration_min_samples, args.wilson_delta)
+                diagnostics["ema_alpha"] = trust_advantage_alpha(
+                    args.ema_decay, q_student, q_teacher, args.ta_ema_min_scale
                 )
-                true_bin_ids = bin_distance_by_class(
-                    true_class_distance_np[cal_valid], true_classes, edges_np
-                )
-                # Fair comparison requires the student on the same weak view
-                # the teacher sees, not the strong-augmented view it trains
-                # on; eval() avoids a second, redundant BatchNorm running-
-                # stat update from this diagnostic-only forward pass (the
-                # real training forward on student_batch already happened
-                # above and is unaffected by this mode toggle).
-                was_training = model.training
-                model.eval()
-                with torch.no_grad():
-                    student_pred_weak_np = model(weak_batch).argmax(dim=1).detach().cpu().numpy()
-                model.train(was_training)
-                student_correct = (student_pred_weak_np[cal_valid] == true_classes).astype(np.float64)
+                diagnostics["ta_ema_q_student"] = q_student if q_student is not None else float("nan")
+                diagnostics["ta_ema_q_teacher"] = q_teacher if q_teacher is not None else float("nan")
+                if q_student is not None and q_teacher is not None:
+                    diagnostics["ta_ema_admitted"] = 1.0 if q_student > q_teacher else 0.0
 
-                student_quality.update(true_classes, true_bin_ids, student_correct)
-                teacher_quality.update(true_classes, true_bin_ids, correct)
-
-        if ta_ema_enabled:
-            q_student = student_quality.quality(args.calibration_min_samples, args.wilson_delta)
-            q_teacher = teacher_quality.quality(args.calibration_min_samples, args.wilson_delta)
-            diagnostics["ema_alpha"] = trust_advantage_alpha(
-                args.ema_decay, q_student, q_teacher, args.ta_ema_min_scale
+            thresholds_np, class_only_np = calibrator.fit_thresholds(
+                grid, args.calibration_min_samples, args.target_precision, args.wilson_delta
             )
-            diagnostics["ta_ema_q_student"] = q_student if q_student is not None else float("nan")
-            diagnostics["ta_ema_q_teacher"] = q_teacher if q_teacher is not None else float("nan")
-            if q_student is not None and q_teacher is not None:
-                diagnostics["ta_ema_admitted"] = 1.0 if q_student > q_teacher else 0.0
+            thresholds_t = torch.from_numpy(thresholds_np).float().to(device)
+            class_only_t = torch.from_numpy(class_only_np).float().to(device)
 
-        thresholds_np, class_only_np = calibrator.fit_thresholds(
-            grid, args.calibration_min_samples, args.target_precision, args.wilson_delta
-        )
-        thresholds_t = torch.from_numpy(thresholds_np).float().to(device)
-        class_only_t = torch.from_numpy(class_only_np).float().to(device)
+            # ---- Algorithm 1, lines 11-12: pseudo-label on Omega_u ----
+            pseudo = build_pseudo_targets(
+                teacher_prob=teacher_prob,
+                omega_u=omega_u,
+                distance=distance,
+                teacher_pred=teacher_pred,
+                reliability=rel["score"],
+                stratum_edges=edges_t,
+                thresholds_table=thresholds_t,
+                class_only_thresholds=class_only_t,
+                d_max=d_max_t,
+                distance_conditioning=(ablation != "class_only"),
+            )
+            loss_pl = masked_soft_ce_loss(student_logits, pseudo["target"], pseudo["mask"])
 
-        # ---- Algorithm 1, lines 11-12: pseudo-label on Omega_u ----
-        pseudo = build_pseudo_targets(
-            teacher_prob=teacher_prob,
-            omega_u=omega_u,
-            distance=distance,
-            teacher_pred=teacher_pred,
-            reliability=rel["score"],
-            stratum_edges=edges_t,
-            thresholds_table=thresholds_t,
-            class_only_thresholds=class_only_t,
-            d_max=d_max_t,
-        )
-        loss_pl = masked_soft_ce_loss(student_logits, pseudo["target"], pseudo["mask"])
-
-        diagnostics.update(
-            {
-                "reliability_mean": rel["score"].mean().item(),
-                "margin_mean": rel["margin"].mean().item(),
-                "stability_mean": rel["stability"].mean().item(),
-                "accepted_ratio": pseudo["accepted_ratio"].item(),
-                "distance_branch_ratio": pseudo["distance_branch_ratio"].item(),
-                "fallback_branch_ratio": pseudo["fallback_branch_ratio"].item(),
-                "finite_thresholds": int(np.isfinite(thresholds_np).sum()),
-                "finite_class_only_thresholds": int(np.isfinite(class_only_np).sum()),
-            }
-        )
+            diagnostics.update(
+                {
+                    "reliability_mean": rel["score"].mean().item(),
+                    "margin_mean": rel["margin"].mean().item(),
+                    "stability_mean": rel["stability"].mean().item(),
+                    "accepted_ratio": pseudo["accepted_ratio"].item(),
+                    "distance_branch_ratio": pseudo["distance_branch_ratio"].item(),
+                    "fallback_branch_ratio": pseudo["fallback_branch_ratio"].item(),
+                    "finite_thresholds": int(np.isfinite(thresholds_np).sum()),
+                    "finite_class_only_thresholds": int(np.isfinite(class_only_np).sum()),
+                }
+            )
 
     return loss_scrib, loss_pl, diagnostics
 
@@ -773,6 +873,7 @@ def train(args):
                         model, model_ema, batch, device, ignore_index, num_classes,
                         case_trees, edges_t, d_max_t, calibrator, grid, args, calibration_active,
                         student_quality=student_quality, teacher_quality=teacher_quality,
+                        ablation=args.ablation,
                     )
                     pseudo_weight = (
                         args.pseudo_loss_weight * sigmoid_rampup(step - warmup_iters, rampup_iters)
@@ -804,8 +905,12 @@ def train(args):
                     or step == args.max_iterations
                 )
                 if should_checkpoint:
-                    # Sec. 5: "only one EMA network is required at inference" -- validate the teacher.
-                    result = validate(model_ema, val_dataset, val_indices, args, device, num_classes)
+                    # Checkpoint selection is by the STUDENT's validation Dice, since the
+                    # student (checkpoint's student_state_dict) is what test_pce_3d.py
+                    # evaluates by default; see checkpoint_payload() and this module's
+                    # docstring. (This departs from Sec. 5's "only the EMA teacher is
+                    # deployed at inference" -- see the docstring for why.)
+                    result = validate(model, val_dataset, val_indices, args, device, num_classes)
                     last_eval_step = step
                     score = result["mean_dice"]
                     if not math.isfinite(score):

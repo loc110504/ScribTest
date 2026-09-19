@@ -9,7 +9,7 @@ Scribble-supervised medical image segmentation benchmark on **ACDC**, **MSCMR**,
 independent **2D slices** (`UNet2D` backbone, the standard protocol in the scribble-supervision
 literature — WSL4MIS, DMSPS, CycleMix, ScribFormer), stitched back into a volume only at
 evaluation time. WORD (abdominal CT, near-isotropic) trains as full **3D volumes** with a `VNet3D`
-backbone. Eight methods share these two pipelines, differing only in how they turn scribbles into a
+backbone. Seven methods share these two pipelines, differing only in how they turn scribbles into a
 loss / pseudo-label:
 
 - **pCE** — partial cross-entropy baseline (loss only on annotated voxels)
@@ -33,19 +33,6 @@ loss / pseudo-label:
   Separation Loss (FBSL, a modified SupCon-style contrastive loss) and a Foreground Augmentation
   with Diverse Context (FADC) copy-paste augmentation; see `code/utils/effdnet.py`. Runs on all 3
   datasets like the methods above.
-- **SC-MT** (Scribble-Calibrated Mean Teacher, this project's second proposed method) — single
-  student + EMA (Mean Teacher) where every connected scribble stroke is assigned once to one of
-  `num_folds` rotating folds; in each training epoch the strokes in the current fold are excluded
-  from the partial-CE loss and instead serve as a held-out probe (their true label is known, so the
-  teacher's prediction there is directly checkable). That outcome, conditioned on the teacher's
-  confidence, predicted class and physical transfer distance to the nearest currently-supervised
-  same-class voxel, populates an EMA-calibrated empirical-reliability table (with hierarchical
-  fallback: cell → class → global → raw confidence) that weights the Mean-Teacher consistency loss
-  on unlabeled voxels — i.e. "trust the teacher exactly where it has been measured to be
-  trustworthy," rather than by raw confidence or a fixed threshold. See `code/utils/scmt.py` and the
-  `train_scmt_2d.py` / `train_scmt_3d.py` module docstrings for the full algorithm and the
-  implementation choices made (transfer distance is deliberately patch/slice-local, not
-  whole-volume — see `batch_transfer_distance_from_labels`'s docstring for why).
 - **ModelMix** (Zhang & Patel, MICCAI 2024) — the one method that is *not* single-dataset: it always
   jointly trains a **pair** of tasks (separate encoder+decoder per task, same encoder architecture),
   periodically blending one random encoder layer between them and regularizing the blend to agree
@@ -70,10 +57,10 @@ cross-source comparability; different literal scribble annotation and preprocess
 min-max-normalized to `[0, 1]`, no voxel spacing metadata — see
 `code/dataloader/expert_scribble_2d.py`'s module docstring). Every method above has a
 `train_<method>_2d_expert.py` counterpart (2D-only; WORD has no expert-scribble archive), sharing
-each method's `*_step()` function and, for VoxTrust-3D/SC-MT/DMSPS, even their per-method 2D
-dataset wrapper class unchanged (`VoxTrustSlice2DDataset`/`SCMTSlice2DDataset`/
-`ExpandedLabel2DDataset` only ever read their `base_dataset` through attributes
-`ExpertScribble2DDataset` also implements). Evaluated with `test_pce_2d_expert.py`/
+each method's `*_step()` function and, for VoxTrust-3D/DMSPS, even their per-method 2D
+dataset wrapper class unchanged (`VoxTrustSlice2DDataset`/`ExpandedLabel2DDataset` only ever read
+their `base_dataset` through attributes `ExpertScribble2DDataset` also implements). Evaluated with
+`test_pce_2d_expert.py`/
 `test_dmsps_2d_expert.py` against this archive's own held-out test patients, not
 `imagesTs`/`labelsTs` — see `code/train/train_pce_2d_expert.py`'s module docstring (also the
 canonical source of `resolve_case_split`/`resolve_val_indices`/`resolve_test_indices`/
@@ -101,17 +88,16 @@ python code/test/test_dmsps_utils.py
 python code/test/test_sdtnet_utils.py
 python code/test/test_voxtrust3d_utils.py
 python code/test/test_effdnet_utils.py     # FBSL contrastive loss, FADC augmentation, EMA warm-up
-python code/test/test_scmt_utils.py        # rotating fold assignment, calibration table, transfer distance
 python code/test/test_modelmix_utils.py    # image/model mixup, encoder layer mixing, rotation
 python code/test/test_train_pce_2d.py      # split resolution, checkpoint round-trip
 python code/test/test_train_dmsps_2d.py    # stage-2 expanded-label dataset wiring
 python code/test/test_train_voxtrust3d_2d.py  # 2D calibration dataset + full voxtrust_step
 python code/test/test_train_effdnet_3d.py  # full effdnet_step, 2D and 3D
-python code/test/test_train_scmt_2d.py     # 2D fold-rotation dataset + full scmt_step
 python code/test/test_train_modelmix_2d.py # full modelmix_task_step, gradient-flow properties
 python code/test/test_common_2d.py         # per-slice resize-then-stitch inference/validation
 python code/test/test_common_3d.py
 python code/test/test_metrics_3d.py
+python code/test/test_select_eval_state_dict.py  # test_pce_{2d,3d}.py's --eval_target checkpoint-shape resolver
 python code/test/test_word_label_remap.py
 python code/test/test_expert_scribble_2d.py   # expert-scribble h5 archive dataset (tiny synthetic fixtures)
 python code/test/test_train_pce_2d_expert.py  # expert-scribble split resolution, checkpoint round-trip
@@ -122,7 +108,7 @@ python -m unittest code.test.test_networks_2d.Network2DShapeTests.test_unet_2d
 ```
 
 Train one method/dataset. ACDC/MSCMR use the `_2d.py` script, WORD uses the `_3d.py` script (swap
-`pce` for `cyclemix` / `sdtnet` / `voxtrust3d` / `effdnet` / `scmt` / `dmsps`):
+`pce` for `cyclemix` / `sdtnet` / `voxtrust3d` / `effdnet` / `dmsps`):
 ```bash
 python code/train/train_pce_2d.py --dataset ACDC --amp     # ACDC | MSCMR
 python code/train/train_pce_3d.py --dataset WORD --amp     # WORD only
@@ -141,8 +127,9 @@ python code/train/train_modelmix_2d.py --amp
 # -> checkpoints/ScribbleBench_ModelMix/ACDC/best.pth and .../MSCMR/best.pth
 ```
 
-Evaluate a checkpoint (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/SC-MT/ModelMix all deploy a plain
-UNet2D/VNet3D checkpoint and share `test_pce_{2d,3d}.py`; DMSPS's dual-decoder network needs
+Evaluate a checkpoint (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/ModelMix all deploy a plain
+UNet2D/VNet3D checkpoint and share `test_pce_{2d,3d}.py` (default `--eval_target student`; pass
+`--eval_target teacher` for VoxTrust-3D's EMA teacher); DMSPS's dual-decoder network needs
 `test_dmsps_{2d,3d}.py`):
 ```bash
 python code/test/test_pce_2d.py --checkpoint checkpoints/ScribbleBench_pCE/ACDC/best.pth --amp
@@ -190,14 +177,14 @@ code/
   networks/
     net_factory.py         # net_factory(net_type, spatial_dims, ...) — construction entry point
     unet_2d.py              # UNet2D / UNetCCT2D backbone (ACDC/MSCMR: pCE/CycleMix/SDT-Net/
-                             # VoxTrust-3D/EFFDNet/SC-MT/ModelMix use UNet2D; DMSPS uses UNetCCT2D)
+                             # VoxTrust-3D/EFFDNet/ModelMix use UNet2D; DMSPS uses UNetCCT2D)
     unet_3d.py, unet_cct_3d.py   # 3D counterparts -- no longer used by any train script
                                   # (kept for reuse/reference; WORD uses VNet, see below)
     vnet_3d.py               # VNet3D / VNetCCT3D backbone (WORD: all single-dataset methods)
     resunet_3d.py, nnunet_3d.py   # Alternative 3D backbones, not wired into any train script
   utils/
     sliding_window_3d.py     # Sliding-window inference for full 3D volumes (WORD)
-    cyclemix.py, dmsps.py, sdtnet.py, voxtrust3d.py, effdnet.py, scmt.py   # Per-method loss/
+    cyclemix.py, dmsps.py, sdtnet.py, voxtrust3d.py, effdnet.py   # Per-method loss/
                               # pseudo-label algorithms, shape-agnostic over 2D [B,C,H,W] / 3D
                               # [B,C,D,H,W] (dispatched on tensor.ndim) so the exact same functions
                               # back both pipelines
@@ -211,22 +198,26 @@ code/
                                # inference for ACDC/MSCMR, mirrors common_3d.validate()
     legacy_splits.py          # Fixed published train/val/test subject IDs (do not resample)
     train_pce_2d.py / train_cyclemix_2d.py / train_dmsps_2d.py / train_sdtnet_2d.py /
-      train_voxtrust3d_2d.py / train_effdnet_2d.py / train_scmt_2d.py    # ACDC/MSCMR only; each
+      train_voxtrust3d_2d.py / train_effdnet_2d.py    # ACDC/MSCMR only; each
                                  # *_step()/loss function is reused directly from its *_3d.py
                                  # sibling (shape-agnostic), only the dataset, network and
                                  # augmentation differ
     train_pce_3d.py / train_cyclemix_3d.py / train_dmsps_3d.py / train_sdtnet_3d.py /
-      train_voxtrust3d_3d.py / train_effdnet_3d.py / train_scmt_3d.py    # WORD only (--dataset
+      train_voxtrust3d_3d.py / train_effdnet_3d.py    # WORD only (--dataset
                                  # choices restricted)
     train_modelmix_2d.py       # No 3D counterpart; no --dataset flag -- always jointly trains
                                # ACDC+MSCMR, producing two checkpoints in one run
     run_baselines.sh            # Full train+test sweep, all methods x all datasets, routes
                                  # ACDC/MSCMR through *_2d.py and WORD through *_3d.py, plus a
                                  # separate ModelMix(ACDC+MSCMR) block
-    run.sh, run_voxtrust3d.sh, run_voxtrust3d_nowarmup.sh   # Narrower/variant sweeps
+    run.sh, run_voxtrust3d.sh, run_voxtrust3d_nowarmup.sh,
+      run_voxtrust3d_dcc_ablation.sh   # Narrower/variant sweeps
+    run_icassp2027_baselines_acdc.sh, run_icassp2027_baselines_mscmr.sh   # paper_icassp2027/
+                                 # main.tex's Table 1 baselines only (excludes WORD), one script
+                                 # per dataset; append to the same results CSV by default
     train_pce_2d_expert.py / train_cyclemix_2d_expert.py / train_dmsps_2d_expert.py /
       train_sdtnet_2d_expert.py / train_voxtrust3d_2d_expert.py / train_effdnet_2d_expert.py /
-      train_scmt_2d_expert.py / train_modelmix_2d_expert.py   # Same methods, sourced from
+      train_modelmix_2d_expert.py   # Same methods, sourced from
                                  # dataloader/expert_scribble_2d.py instead -- train_pce_2d_expert.py
                                  # is the canonical source of resolve_case_split/resolve_val_indices/
                                  # resolve_test_indices/build_val_dataset/build_test_dataset that
@@ -236,9 +227,11 @@ code/
                                  # ACDC+MSCMR); mirrors run_baselines.sh
   test/
     test_pce_2d.py, test_dmsps_2d.py   # Evaluators for ACDC/MSCMR (per-slice stitch inference) --
-                                        # also used for EFFDNet/SC-MT/ModelMix (plain UNet2D checkpoints)
+                                        # also used for EFFDNet/ModelMix (plain UNet2D checkpoints);
+                                        # --eval_target {student,teacher} (default student) picks
+                                        # which half of a Mean Teacher checkpoint (VoxTrust-3D) to load
     test_pce_3d.py, test_dmsps_3d.py   # Evaluators for WORD (sliding-window inference) -- also
-                                        # used for EFFDNet/SC-MT (plain VNet3D checkpoint)
+                                        # used for EFFDNet (plain VNet3D checkpoint)
     test_pce_2d_expert.py, test_dmsps_2d_expert.py   # Same evaluators, against the expert-scribble
                                         # archive's own held-out test patients (not imagesTs/labelsTs);
                                         # HD95/ASSD are in pixel units there (no spacing metadata)
@@ -275,9 +268,9 @@ results/       # metrics.json, baselines_summary.csv / expert_baselines_summary.
   two validation strategies.
 - **Loss functions are shape-dispatched, not duplicated**: `partial_cross_entropy`
   (`train/common_3d.py`) and every per-method loss in
-  `utils/{cyclemix,dmsps,sdtnet,voxtrust3d,scmt}.py` branch on `tensor.ndim` (4 → 2D `[B,C,H,W]`,
+  `utils/{cyclemix,dmsps,sdtnet,voxtrust3d}.py` branch on `tensor.ndim` (4 → 2D `[B,C,H,W]`,
   5 → 3D `[B,C,D,H,W]`) rather than having separate 2D and 3D copies. The `*_step()` orchestration
-  functions (`cyclemix_step`, `dmsps_step`, `sdtnet_step`, `voxtrust_step`, `scmt_step`) are
+  functions (`cyclemix_step`, `dmsps_step`, `sdtnet_step`, `voxtrust_step`) are
   themselves dimension-agnostic and are imported directly from the `_3d.py` script into the
   `_2d.py` script — when changing one of these, check both pipelines.
 - **Fixed splits, not resampled**: `code/train/legacy_splits.py` hardcodes published
@@ -302,10 +295,16 @@ results/       # metrics.json, baselines_summary.csv / expert_baselines_summary.
   include subject2/subject4 (excluded from ScribbleBench because their dense labels are unavailable
   there); `resolve_case_split` drops them and logs it rather than raising, since -- unlike a missing
   published group -- an *extra* on-disk group is not a broken dataset here.
-- **Checkpoint compatibility**: within one pipeline, pCE, CycleMix, SDT-Net, VoxTrust-3D, EFFDNet
-  and SC-MT all checkpoint a plain `UNet2D`/`VNet3D` `model_state_dict` (for VoxTrust-3D and SC-MT
-  this is the EMA teacher's weights, per Mean Teacher's "only one EMA network required at
-  inference") and are evaluated with the same `test_pce_{2d,3d}.py`. DMSPS uses a dual-decoder network
+- **Checkpoint compatibility**: within one pipeline, pCE, CycleMix, SDT-Net, VoxTrust-3D and
+  EFFDNet all checkpoint a plain `UNet2D`/`VNet3D` and are evaluated with the same
+  `test_pce_{2d,3d}.py`. VoxTrust-3D additionally saves both halves of its Mean Teacher pair
+  (`model_state_dict` = EMA teacher, `student_state_dict` = student); `test_pce_{2d,3d}.py`'s
+  `--eval_target` (default `student`) picks which one is evaluated. The default is the student for
+  every method here (EFFDNet/SDT-Net already deployed their student; VoxTrust-3D's training script
+  also selects `best.pth` by the student's validation Dice, not the teacher's, to match) -- a
+  deliberate departure from Mean Teacher's usual "only one EMA network required at inference"
+  convention (and from `paper_icassp2027/main.tex`'s own Sec. 3.3, which still describes deploying
+  the teacher); pass `--eval_target teacher` to recover that number. DMSPS uses a dual-decoder network
   (`UNetCCT2D`/`VNetCCT3D`) and has its own evaluator, `test_dmsps_{2d,3d}.py`. Every evaluator
   reads dataset, class count, patch size, and backbone width from the checkpoint itself and loads
   weights strictly — don't hand-edit a checkpoint's shape metadata. A 2D checkpoint's
@@ -344,18 +343,6 @@ results/       # metrics.json, baselines_summary.csv / expert_baselines_summary.
   through that same task's *other* loss terms (own supervision, image-level mixup), which do call
   the real encoder. This is intentional, not a bug — see `mix_one_encoder_layer`'s docstring before
   "fixing" it.
-- **SC-MT's held-out fold rotates every epoch, not once per run**: unlike VoxTrust-3D's
-  once-per-run `Omega_sup`/`Omega_cal` split, `utils/scmt.py`'s scribble-block-to-fold assignment is
-  fixed at dataset construction but *which* fold is excluded from the partial-CE loss changes every
-  epoch (`train_dataset.held_out_fold = epoch % args.num_folds`, set by the training loop, not the
-  dataset). This requires `persistent_workers=False` on both `train_scmt_2d.py`'s and
-  `train_scmt_3d.py`'s `DataLoader` — with persistent workers, an already-forked worker process
-  would keep using whichever fold was set when it was spawned and silently never see the rotation.
-  Its transfer distance is also deliberately patch/slice-local (rebuilt from whatever supervised
-  voxels are visible in the current training patch), not whole-volume like VoxTrust-3D's
-  coordinate-tracked version — see `batch_transfer_distance_from_labels`'s docstring for why this
-  tradeoff was made and why it doesn't undermine the calibration table's correctness.
-
 ## Coding style
 
 Four-space indentation, `snake_case` for modules/functions/variables/CLI flags, `PascalCase` for

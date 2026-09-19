@@ -144,6 +144,114 @@ class VoxtrustStep2DIntegrationTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in model_ema.parameters()))
 
 
+class VoxtrustStep2DAblationTests(unittest.TestCase):
+    """Table 2 ("Ablating Trust Calibration", paper_icassp2027/main.tex)
+    component ablation arms, exercised through the shared voxtrust_step."""
+
+    class Args:
+        use_strong_aug = True
+        strong_brightness = 0.2
+        strong_brightness_prob = 1.0
+        strong_contrast = 0.2
+        strong_contrast_prob = 1.0
+        strong_gamma = 0.3
+        strong_gamma_prob = 1.0
+        strong_noise_std = 0.05
+        strong_noise_prob = 1.0
+        strong_blur_prob = 0.0
+        strong_blur_sigma_min = 0.2
+        strong_blur_sigma_max = 1.0
+        calibration_min_samples = 1
+        target_precision = 0.5
+        wilson_delta = 0.05
+        ema_decay = 0.99
+        ta_ema_min_scale = 0.1
+        global_confidence_threshold = 0.75
+
+    def _run_step(self, holdout_fraction, ablation, global_confidence_threshold=None):
+        torch.manual_seed(0)
+        base = FakeScribbleBench2DDataset()
+        dataset = VoxTrustSlice2DDataset(
+            base, [0, 1], holdout_fraction=holdout_fraction, seed=7, patch_size=(16, 16)
+        )
+        case_trees = {sid: dataset.case_trees(sid) for sid in dataset.slice_ids}
+        edges_np, d_max_np = fit_distance_bins(dataset.per_case_partitions(), base.num_classes, num_strata=3)
+        device = torch.device("cpu")
+        edges_t = torch.from_numpy(edges_np).float().to(device)
+        d_max_t = torch.from_numpy(d_max_np).float().to(device)
+
+        loader = DataLoader(dataset, batch_size=2, shuffle=False)
+        batch = next(iter(loader))
+
+        model = UNet2D(in_chns=1, class_num=base.num_classes, feature_chns=(4, 8, 16, 24, 32))
+        model_ema = UNet2D(in_chns=1, class_num=base.num_classes, feature_chns=(4, 8, 16, 24, 32))
+        model_ema.load_state_dict(model.state_dict())
+        for p in model_ema.parameters():
+            p.requires_grad_(False)
+
+        calibrator = RollingCalibrationBuffer(
+            num_classes=base.num_classes, num_strata=3, buffer_size=64, block_cap=8,
+            rng=np.random.default_rng(stable_seed(7, "calibrator")),
+        )
+        grid = np.linspace(0.0, 1.0, 21)
+
+        args = self.Args()
+        if global_confidence_threshold is not None:
+            args.global_confidence_threshold = global_confidence_threshold
+
+        return voxtrust_step(
+            model, model_ema, batch, device, base.ignore_index, base.num_classes,
+            case_trees, edges_t, d_max_t, calibrator, grid, args,
+            calibration_active=True, augment_fn=strong_intensity_augment_2d,
+            ablation=ablation,
+        )
+
+    def test_default_ablation_matches_full(self):
+        # Backward compatibility: a caller that never passes `ablation=`
+        # (e.g. train_voxtrust3d_2d_expert.py today) must still get "full".
+        loss_scrib, loss_pl, diagnostics = self._run_step(0.15, "full")
+        self.assertTrue(torch.isfinite(loss_scrib))
+        self.assertTrue(torch.isfinite(loss_pl))
+        self.assertIn("distance_branch_ratio", diagnostics)
+        self.assertIn("finite_class_only_thresholds", diagnostics)
+
+    def test_all_pseudo_labels_accepts_every_unlabeled_pixel(self):
+        loss_scrib, loss_pl, diagnostics = self._run_step(0.0, "all_pseudo_labels")
+        self.assertTrue(torch.isfinite(loss_scrib))
+        self.assertTrue(torch.isfinite(loss_pl))
+        self.assertAlmostEqual(diagnostics["accepted_ratio"], 1.0, places=6)
+        # No Omega_cal evidence was ever used, so calibration diagnostics
+        # from the "full"/"class_only" branch must not appear.
+        self.assertNotIn("finite_thresholds", diagnostics)
+        self.assertNotIn("distance_branch_ratio", diagnostics)
+
+    def test_global_confidence_threshold_above_one_rejects_everything(self):
+        # R_i in [0, 1] by construction (reliability_score), so a threshold
+        # above 1 deterministically rejects every candidate regardless of
+        # the (randomly initialized) network's actual outputs.
+        loss_scrib, loss_pl, diagnostics = self._run_step(
+            0.0, "global_confidence", global_confidence_threshold=1.1
+        )
+        self.assertTrue(torch.isfinite(loss_scrib))
+        self.assertEqual(loss_pl.item(), 0.0)
+        self.assertAlmostEqual(diagnostics["accepted_ratio"], 0.0, places=6)
+
+    def test_global_confidence_threshold_zero_accepts_everything(self):
+        loss_scrib, loss_pl, diagnostics = self._run_step(
+            0.0, "global_confidence", global_confidence_threshold=0.0
+        )
+        self.assertTrue(torch.isfinite(loss_scrib))
+        self.assertTrue(torch.isfinite(loss_pl))
+        self.assertAlmostEqual(diagnostics["accepted_ratio"], 1.0, places=6)
+
+    def test_class_only_ablation_never_uses_distance_branch(self):
+        loss_scrib, loss_pl, diagnostics = self._run_step(0.15, "class_only")
+        self.assertTrue(torch.isfinite(loss_scrib))
+        self.assertTrue(torch.isfinite(loss_pl))
+        self.assertIn("distance_branch_ratio", diagnostics)
+        self.assertAlmostEqual(diagnostics["distance_branch_ratio"], 0.0, places=6)
+
+
 class FakeScribbleBench2DDatasetWithManyBlocks:
     """Like FakeScribbleBench2DDataset, but class 1 has several disjoint
     single-voxel blocks per slice instead of one -- with only one block,
@@ -320,6 +428,7 @@ class ValidateArgsPatchDivisibilityTests(unittest.TestCase):
             holdout_fraction=0.15, distance_strata=3, target_precision=0.95, wilson_delta=0.05,
             calibration_min_samples=32, calibration_buffer_size=4096, calibration_block_cap=64,
             score_grid_points=101, warmup_frac=0.1, rampup_frac=0.2, pseudo_loss_weight=8.0,
+            ablation="full", global_confidence_threshold=0.75,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -333,6 +442,21 @@ class ValidateArgsPatchDivisibilityTests(unittest.TestCase):
             validate_args(self._args(ta_ema_min_scale=1.5))
         with self.assertRaisesRegex(ValueError, "ta_ema_min_scale"):
             validate_args(self._args(ta_ema_min_scale=-0.1))
+
+    def test_zero_holdout_fraction_is_allowed(self):
+        # global_confidence/all_pseudo_labels ablations run with eta=0.
+        args = validate_args(self._args(holdout_fraction=0.0, ablation="all_pseudo_labels"))
+        self.assertEqual(args.holdout_fraction, 0.0)
+
+    def test_negative_holdout_fraction_rejected(self):
+        with self.assertRaisesRegex(ValueError, "holdout_fraction"):
+            validate_args(self._args(holdout_fraction=-0.1))
+
+    def test_global_confidence_threshold_out_of_range_rejected(self):
+        with self.assertRaisesRegex(ValueError, "global_confidence_threshold"):
+            validate_args(self._args(global_confidence_threshold=1.5))
+        with self.assertRaisesRegex(ValueError, "global_confidence_threshold"):
+            validate_args(self._args(global_confidence_threshold=-0.1))
 
 
 if __name__ == "__main__":

@@ -5,13 +5,15 @@
 #
 # ACDC/MSCMR route through the 2D slice pipeline (train_voxtrust3d_2d.py);
 # WORD, if added to SCRIBBLE_DATASETS, routes through the full-3D VNet
-# pipeline (train_voxtrust3d_3d.py). Either way VoxTrust-3D's checkpointed
-# model is the EMA teacher, saved as a plain UNet2D/VNet3D in the same
-# schema_version=1 layout the other baselines use (see the training script's
-# module docstring), so it is fed through the exact same evaluator as
-# pCE/CycleMix/SDT-Net (test_pce_2d.py / test_pce_3d.py): images go through
-# the network and the predicted volumes are compared against the dense test
-# masks to compute Dice/HD95/ASSD.
+# pipeline (train_voxtrust3d_3d.py). Either way VoxTrust-3D's checkpoint
+# carries both the EMA teacher and the student, saved as a plain
+# UNet2D/VNet3D in the same schema_version=1 layout the other baselines use
+# (see the training script's module docstring), so it is fed through the
+# exact same evaluator as pCE/CycleMix/SDT-Net (test_pce_2d.py /
+# test_pce_3d.py); that evaluator's default --eval_target student evaluates
+# the student, not the teacher -- pass --eval_target teacher to recover the
+# old teacher-based number. Images go through the network and the predicted
+# volumes are compared against the dense test masks to compute Dice/HD95/ASSD.
 #
 # Environment variable overrides (all optional):
 #   SCRIBBLE_DATASETS                space-separated subset, default "ACDC MSCMR"

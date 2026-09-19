@@ -29,8 +29,8 @@ view:
   ``num_classes``/``ignore_index``, plus ``slice_positions_for_volumes``) so
   every existing per-method 2D dataset wrapper (``ExpandedLabel2DDataset`` in
   ``train_dmsps_2d.py``, ``VoxTrustSlice2DDataset`` in
-  ``train_voxtrust3d_2d.py``, ``SCMTSlice2DDataset`` in ``train_scmt_2d.py``)
-  can be reused completely unchanged, just fed this class instead.
+  ``train_voxtrust3d_2d.py``) can be reused completely unchanged, just fed
+  this class instead.
 - :class:`ExpertScribbleVolumeDataset` -- per-case ``(D, H, W)`` volumes with
   dense ``gt_label``, for validation (``ACDC_training_volumes`` filtered to
   the published val patients; MSCMR's own dedicated
@@ -42,8 +42,8 @@ view:
 No voxel spacing is stored anywhere in this archive (unlike the NIfTI
 pipeline's header-derived spacing): every sample reports a placeholder
 isotropic ``(1.0, 1.0, 1.0)`` spacing. This is harmless for training (only
-``utils.scmt``'s physical transfer distance actually consumes spacing, and
-degrades gracefully to a pixel distance), but means HD95/ASSD reported by
+``utils.voxtrust3d``'s physical transfer distance actually consumes spacing,
+and degrades gracefully to a pixel distance), but means HD95/ASSD reported by
 ``test/test_pce_2d_expert.py``/``test/test_dmsps_2d_expert.py`` are in pixel
 units, not calibrated millimeters -- read them as such.
 """

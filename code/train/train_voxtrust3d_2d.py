@@ -22,17 +22,32 @@ the 2D counterpart of ``choose_patch_origin``/``build_patch_coordinates``/
 Only sparse labels in ``labelsTr`` (split further into Omega_sup/Omega_cal)
 contribute to optimization. Dense training labels are accessed exclusively
 for model selection on a patient-level holdout, exactly as in
-``train_pce_2d.py``. Per Sec. 5 ("only one EMA network is required at
-inference; the calibrator is removed"), the deployed/checkpointed model is
-the EMA teacher, saved in the same schema as the sibling 2D baselines -- so
-``code/test/test_pce_2d.py`` evaluates ``best.pth`` directly. WORD stays a
-full-3D VNet pipeline, see ``train_voxtrust3d_3d.py``.
+``train_pce_2d.py``.
+
+Deployed model: the checkpoint saves BOTH nets (``model_state_dict`` = EMA
+teacher, ``student_state_dict`` = student), but model selection (which
+iteration becomes ``best.pth``) and ``code/test/test_pce_2d.py``'s default
+evaluation target are both the **student**, not the teacher -- a deliberate
+departure from Sec. 5's own protocol ("only one EMA network is required at
+inference; the calibrator is removed"), so that every baseline in this repo
+is finally judged by the network that gradient descent actually trained,
+rather than by an EMA smoothing artifact that differs per method (EFFDNet/
+SDT-Net already deployed their student; VoxTrust-3D previously did not).
+Pass ``test_pce_2d.py --eval_target teacher`` to recover the old
+teacher-based number for comparison. WORD stays a full-3D VNet pipeline, see
+``train_voxtrust3d_3d.py``.
 
 Trust-Advantage EMA (``--ta_ema``, this project's own extension to the base
 paper) is also wired in here exactly as in ``train_voxtrust3d_3d.py`` --
 ``voxtrust_step`` gates the EMA update the same shape-agnostic way for both
 pipelines; see that script's module docstring and
 ``utils.voxtrust3d.trust_advantage_alpha`` for the mechanism.
+
+``--ablation`` (Table 2, ``paper_icassp2027/main.tex``, "Ablating Trust
+Calibration") is likewise forwarded straight into ``voxtrust_step`` from
+``train_voxtrust3d_3d.py`` unchanged -- see that script's docstring for the
+four arms and ``code/train/run_voxtrust3d_dcc_ablation.sh`` for the sweep
+that reproduces the table on ACDC/MSCMR.
 """
 
 import argparse
@@ -122,7 +137,9 @@ def parse_args():
         "--ta_ema_min_scale", type=float, default=0.1,
         help="floor scale applied to the EMA update rate when the student lacks a calibrated trust advantage",
     )
-    parser.add_argument("--holdout_fraction", type=float, default=0.15, help="eta")
+    parser.add_argument(
+        "--holdout_fraction", type=float, default=0.15, help="eta; 0 disables the Omega_cal split entirely"
+    )
     parser.add_argument("--distance_strata", type=int, default=3, help="B")
     parser.add_argument("--target_precision", type=float, default=0.95, help="rho")
     parser.add_argument("--wilson_delta", type=float, default=0.05, help="delta")
@@ -130,6 +147,26 @@ def parse_args():
     parser.add_argument("--calibration_buffer_size", type=int, default=4096, help="N_max")
     parser.add_argument("--calibration_block_cap", type=int, default=64, help="m_max")
     parser.add_argument("--score_grid_points", type=int, default=101, help="|T|, grid over [0, 1]")
+
+    # Table 2 component ablation ("Ablating Trust Calibration",
+    # paper_icassp2027/main.tex). See utils/voxtrust3d.py's module docstring.
+    parser.add_argument(
+        "--ablation",
+        default="full",
+        choices=["full", "class_only", "global_confidence", "all_pseudo_labels"],
+        help=(
+            "full: proposed method (held-out calibration + distance conditioning). "
+            "class_only: held-out calibration pooled across distance strata. "
+            "global_confidence: one fixed, uncalibrated reliability cutoff "
+            "(--global_confidence_threshold), no Omega_cal. all_pseudo_labels: "
+            "unfiltered Mean Teacher transfer, no Omega_cal. Pass --holdout_fraction 0 "
+            "with the latter two, since they never consult Omega_cal."
+        ),
+    )
+    parser.add_argument(
+        "--global_confidence_threshold", type=float, default=0.75,
+        help="fixed reliability cutoff used only by --ablation global_confidence",
+    )
     parser.add_argument("--warmup_frac", type=float, default=0.1)
     parser.add_argument("--rampup_frac", type=float, default=0.2)
     parser.add_argument("--pseudo_loss_weight", type=float, default=8.0, help="lambda_max")
@@ -170,8 +207,8 @@ def validate_args(args):
         raise ValueError("ema_decay must satisfy 0 < alpha < 1")
     if not 0.0 <= args.ta_ema_min_scale <= 1.0:
         raise ValueError("ta_ema_min_scale must be in [0, 1]")
-    if not 0.0 < args.holdout_fraction < 1.0:
-        raise ValueError("holdout_fraction must satisfy 0 < eta < 1")
+    if not 0.0 <= args.holdout_fraction < 1.0:
+        raise ValueError("holdout_fraction must satisfy 0 <= eta < 1")
     if args.distance_strata < 1:
         raise ValueError("distance_strata must be >= 1")
     if not 0.0 < args.target_precision <= 1.0:
@@ -184,6 +221,8 @@ def validate_args(args):
         raise ValueError("calibration_buffer_size/calibration_block_cap must be positive")
     if args.score_grid_points < 2:
         raise ValueError("score_grid_points must be >= 2")
+    if not 0.0 <= args.global_confidence_threshold <= 1.0:
+        raise ValueError("global_confidence_threshold must be in [0, 1]")
     if not 0.0 <= args.warmup_frac < 1.0:
         raise ValueError("warmup_frac must satisfy 0 <= warmup_frac < 1")
     if args.rampup_frac <= 0.0:
@@ -507,6 +546,7 @@ def train(args):
                         case_trees, edges_t, d_max_t, calibrator, grid, args, calibration_active,
                         student_quality=student_quality, teacher_quality=teacher_quality,
                         augment_fn=strong_intensity_augment_2d,
+                        ablation=args.ablation,
                     )
                     pseudo_weight = (
                         args.pseudo_loss_weight * sigmoid_rampup(step - warmup_iters, rampup_iters)
@@ -538,7 +578,11 @@ def train(args):
                     or step == args.max_iterations
                 )
                 if should_checkpoint:
-                    result = validate_2d(model_ema, val_dataset, val_case_indices, args, device, num_classes)
+                    # Checkpoint selection is by the STUDENT's validation Dice, since the
+                    # student (model_state_dict/"model" -> checkpoint's student_state_dict)
+                    # is what test_pce_2d.py evaluates by default; see checkpoint_payload()
+                    # and this module's docstring.
+                    result = validate_2d(model, val_dataset, val_case_indices, args, device, num_classes)
                     last_eval_step = step
                     score = result["mean_dice"]
                     if not math.isfinite(score):

@@ -25,6 +25,7 @@ from utils.voxtrust3d import (
     choose_patch_origin,
     fit_distance_bins,
     gather_patch,
+    global_threshold_pseudo_targets,
     masked_soft_ce_loss,
     query_transfer_distance,
     random_flip_rotate,
@@ -36,6 +37,7 @@ from utils.voxtrust3d import (
     strong_intensity_augment_2d,
     strong_intensity_augment_3d,
     trust_advantage_alpha,
+    unconditional_pseudo_targets,
     wilson_lower_bound,
 )
 
@@ -123,9 +125,22 @@ class SpatiallyBlockedPartitionTests(unittest.TestCase):
     def test_holdout_fraction_out_of_range_raises(self):
         label = self._label_with_n_blocks(3)
         with self.assertRaises(ValueError):
-            spatially_blocked_partition(label, 2, 2, 0.0, np.random.default_rng(0))
+            spatially_blocked_partition(label, 2, 2, -0.1, np.random.default_rng(0))
         with self.assertRaises(ValueError):
             spatially_blocked_partition(label, 2, 2, 1.0, np.random.default_rng(0))
+
+    def test_zero_holdout_fraction_holds_out_nothing(self):
+        # Used by the global_confidence/all_pseudo_labels ablations (Table 2,
+        # paper_icassp2027/main.tex), which never consult Omega_cal and
+        # should not waste any scribble on it.
+        label = self._label_with_n_blocks(10)
+        rng = np.random.default_rng(0)
+        sup, cal, cal_block = spatially_blocked_partition(label, ignore_index=2, num_classes=2, holdout_fraction=0.0, rng=rng)
+        self.assertEqual(len(cal[1]), 0)
+        self.assertEqual(len(cal_block[1]), 0)
+        expected = {tuple(row) for row in np.argwhere(label == 1)}
+        sup_set = {tuple(row) for row in sup[1]}
+        self.assertEqual(sup_set, expected)
 
     def test_2d_label_produces_two_column_coordinates(self):
         # One ACDC/MSCMR slice: 10 disjoint single-voxel class-1 blocks,
@@ -507,6 +522,84 @@ class BuildPseudoTargetsTests(unittest.TestCase):
             teacher_prob, omega_u, distance, teacher_pred, reliability,
             stratum_edges, thresholds_table, class_only, d_max,
         )
+        self.assertTrue(torch.all(out["mask"] == 0))
+
+    def test_distance_conditioning_false_ignores_in_support_stratum_threshold(self):
+        # Table 2 "MT, class-only calibration" ablation: even a voxel that
+        # IS within d_max and would pass the per-stratum threshold must be
+        # judged solely against class_only_thresholds when
+        # distance_conditioning=False.
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 1.0)  # well within support
+        thresholds_table = torch.tensor([[0.0], [math.inf]])  # per-stratum: would accept (reliability=0.9 >= 0.0)
+        class_only = torch.tensor([math.inf, math.inf])  # class-only: abstains
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+            distance_conditioning=False,
+        )
+        self.assertTrue(torch.all(out["mask"] == 0))
+        self.assertAlmostEqual(out["distance_branch_ratio"].item(), 0.0)
+
+    def test_distance_conditioning_false_accepts_via_class_only(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 1.0)
+        thresholds_table = torch.tensor([[math.inf], [math.inf]])  # per-stratum would reject
+        class_only = torch.tensor([0.5, math.inf])  # class-only accepts (reliability=0.9 >= 0.5)
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+            distance_conditioning=False,
+        )
+        self.assertTrue(torch.all(out["mask"] > 0))
+        self.assertAlmostEqual(out["fallback_branch_ratio"].item(), 1.0)
+
+
+class UnconditionalPseudoTargetsTests(unittest.TestCase):
+    def test_accepts_every_omega_u_candidate(self):
+        teacher_prob = torch.zeros(1, 2, 1, 1, 3)
+        teacher_prob[0, 0] = 1.0
+        omega_u = torch.tensor([[[[True, False, True]]]])
+        out = unconditional_pseudo_targets(teacher_prob, omega_u)
+        expected_mask = omega_u.float().unsqueeze(1)
+        torch.testing.assert_close(out["mask"], expected_mask)
+        self.assertAlmostEqual(out["accepted_ratio"].item(), 1.0)
+
+    def test_target_matches_normalized_teacher_prob(self):
+        teacher_prob = torch.zeros(1, 2, 1, 1, 1)
+        teacher_prob[0, 0] = 1.0
+        omega_u = torch.ones(1, 1, 1, 1, dtype=torch.bool)
+        out = unconditional_pseudo_targets(teacher_prob, omega_u)
+        torch.testing.assert_close(out["target"], teacher_prob)
+
+
+class GlobalThresholdPseudoTargetsTests(unittest.TestCase):
+    def test_below_threshold_rejects(self):
+        teacher_prob = torch.zeros(1, 2, 1, 1, 3)
+        teacher_prob[0, 0] = 1.0
+        reliability = torch.full((1, 1, 1, 3), 0.5)
+        omega_u = torch.ones(1, 1, 1, 3, dtype=torch.bool)
+        out = global_threshold_pseudo_targets(teacher_prob, omega_u, reliability, threshold=0.75)
+        self.assertTrue(torch.all(out["mask"] == 0))
+        self.assertAlmostEqual(out["accepted_ratio"].item(), 0.0)
+
+    def test_at_or_above_threshold_accepts(self):
+        teacher_prob = torch.zeros(1, 2, 1, 1, 3)
+        teacher_prob[0, 0] = 1.0
+        reliability = torch.full((1, 1, 1, 3), 0.75)
+        omega_u = torch.ones(1, 1, 1, 3, dtype=torch.bool)
+        out = global_threshold_pseudo_targets(teacher_prob, omega_u, reliability, threshold=0.75)
+        self.assertTrue(torch.all(out["mask"] > 0))
+        self.assertAlmostEqual(out["accepted_ratio"].item(), 1.0)
+
+    def test_omega_u_false_always_rejects(self):
+        teacher_prob = torch.zeros(1, 2, 1, 1, 3)
+        teacher_prob[0, 0] = 1.0
+        reliability = torch.full((1, 1, 1, 3), 1.0)
+        omega_u = torch.zeros(1, 1, 1, 3, dtype=torch.bool)
+        out = global_threshold_pseudo_targets(teacher_prob, omega_u, reliability, threshold=0.0)
         self.assertTrue(torch.all(out["mask"] == 0))
 
 

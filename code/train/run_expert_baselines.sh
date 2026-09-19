@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train + test pCE, CycleMix, SDT-Net, EFFDNet, SC-MT and DMSPS (stage 1 and
+# Train + test pCE, CycleMix, SDT-Net, EFFDNet and DMSPS (stage 1 and
 # stage 2) on the "expert scribble" ACDC/MSCMR archive
 # (<repo_root>/data/{ACDC,MSCMR}, the original WSL4MIS/CycleMix h5 dataset),
 # plus ModelMix jointly on ACDC+MSCMR, appending every result to one summary
@@ -22,13 +22,11 @@
 #   2. train_cyclemix_2d_expert.py  -> test_pce_2d_expert.py
 #   3. train_sdtnet_2d_expert.py    -> test_pce_2d_expert.py
 #   4. train_effdnet_2d_expert.py   -> test_pce_2d_expert.py
-#   5. train_scmt_2d_expert.py      -> test_pce_2d_expert.py
-#   6. train_dmsps_2d_expert.py     -> test_dmsps_2d_expert.py (--stage 1/2)
+#   5. train_dmsps_2d_expert.py     -> test_dmsps_2d_expert.py (--stage 1/2)
 #
-# pCE/CycleMix/SDT-Net/EFFDNet/SC-MT all checkpoint a plain UNet2D (SC-MT's
-# deployed model is its EMA teacher, EFFDNet's is its student) -- so all five
-# share test_pce_2d_expert.py; DMSPS's dual-decoder DB-Net has its own
-# evaluator, test_dmsps_2d_expert.py.
+# pCE/CycleMix/SDT-Net/EFFDNet all checkpoint a plain UNet2D (EFFDNet's is
+# its student) -- so all four share test_pce_2d_expert.py; DMSPS's
+# dual-decoder DB-Net has its own evaluator, test_dmsps_2d_expert.py.
 #
 # ModelMix (Zhang & Patel, MICCAI 2024) is run separately, once, after the
 # per-dataset loop below: it always jointly trains ACDC+MSCMR in one run (no
@@ -111,11 +109,6 @@ train_and_test() {
         --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
         $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
       ;;
-    SCMT)
-      python "$script_dir/train_scmt_2d_expert.py" --dataset "$dataset" \
-        --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
-        $amp_flag $device_flag $root_path_flag "$@" $extra_train_args
-      ;;
     DMSPS)
       python "$script_dir/train_dmsps_2d_expert.py" --dataset "$dataset" \
         --output_dir "$ckpt_dir" --batch_size "$batch_size" --num_workers "$num_workers" \
@@ -129,7 +122,7 @@ train_and_test() {
 
   echo "=== [$method_label] dataset=$dataset (expert) stage=${stage:-none}: test ==="
   case "$method_label" in
-    pCE|CycleMix|SDTNet|EFFDNet|SCMT)
+    pCE|CycleMix|SDTNet|EFFDNet)
       python "$test_dir/test_pce_2d_expert.py" \
         --checkpoint "$ckpt_dir/best.pth" --output_dir "$results_dir" \
         $amp_flag $device_flag $root_path_flag $extra_test_args
@@ -160,10 +153,6 @@ for dataset in "${datasets[@]}"; do
   train_and_test EFFDNet "$dataset" "" \
     "$checkpoint_root/ExpertScribble_EFFDNet/$dataset" \
     "$results_root/ExpertScribble_EFFDNet/$dataset"
-
-  train_and_test SCMT "$dataset" "" \
-    "$checkpoint_root/ExpertScribble_SCMT/$dataset" \
-    "$results_root/ExpertScribble_SCMT/$dataset"
 
   dmsps_stage1_ckpt_dir="$checkpoint_root/ExpertScribble_DMSPS/$dataset/stage1"
   train_and_test DMSPS "$dataset" stage1 \

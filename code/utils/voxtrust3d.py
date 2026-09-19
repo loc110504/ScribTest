@@ -37,6 +37,23 @@ anywhere in this module, but it does now influence the parameter trajectory
 indirectly through this non-gradient EMA gate, not only through the
 teacher/pseudo-label machinery of points 1-4.
 
+Component ablation (Table 2, ``paper_icassp2027/main.tex``, "Ablating Trust
+Calibration"): ``--ablation`` on both training scripts selects which of
+points 2-3 above are active. ``full`` (default) is the method described
+above. ``class_only`` keeps the held-out Wilson calibration of point 3 but
+pools it across distance strata (``build_pseudo_targets(...,
+distance_conditioning=False)``) -- isolating the contribution of distance
+conditioning on top of held-out calibration alone. ``global_confidence`` and
+``all_pseudo_labels`` never touch ``Omega_cal`` at all (pass
+``--holdout_fraction 0``, which ``spatially_blocked_partition`` accepts):
+the former (``global_threshold_pseudo_targets``) accepts every candidate
+whose reliability score clears one fixed, uncalibrated cutoff; the latter
+(``unconditional_pseudo_targets``) is plain, unfiltered Mean Teacher
+pseudo-label transfer. See ``train/train_voxtrust3d_3d.py``'s
+``voxtrust_step`` for how the four arms dispatch and
+``code/train/run_voxtrust3d_dcc_ablation.sh`` for the sweep that reproduces
+Table 2.
+
 This module intentionally has no dataset/I-O code; see
 ``train/train_voxtrust3d_3d.py`` for the training loop that wires these
 pieces to ``dataloader.scribblebench_3d.ScribbleBench3DDataset``.
@@ -145,6 +162,13 @@ def spatially_blocked_partition(label, ignore_index, num_classes, holdout_fracti
     removing a class's last remaining block ("if a class has only one
     scribble block in a volume, that block remains in Omega_sup", Sec. 5).
 
+    ``holdout_fraction=0.0`` is allowed and holds out nothing (every block
+    stays in ``Omega_sup``, every ``cal_coords``/``cal_block_id`` entry comes
+    back empty) -- used by the ``global_confidence``/``all_pseudo_labels``
+    ablation arms (Table 2, ``paper_icassp2027/main.tex``), which never
+    consult ``Omega_cal`` and would otherwise waste annotation by holding out
+    scribbles for a calibration mechanism they don't run.
+
     Args:
         label: ``(D, H, W)`` (3D volume) or ``(H, W)`` (single 2D slice)
             integer scribble array (``ignore_index`` = unlabeled).
@@ -157,8 +181,8 @@ def spatially_blocked_partition(label, ignore_index, num_classes, holdout_fracti
             used later to cap how many voxels from one block/stroke can
             enter the rolling calibration memory in a single update.
     """
-    if not 0.0 < holdout_fraction < 1.0:
-        raise ValueError("holdout_fraction must be in (0, 1), got {}".format(holdout_fraction))
+    if not 0.0 <= holdout_fraction < 1.0:
+        raise ValueError("holdout_fraction must be in [0, 1), got {}".format(holdout_fraction))
     if np.any((label != ignore_index) & ((label < 0) | (label >= num_classes))):
         raise ValueError("label contains a class outside [0, num_classes) and != ignore_index")
 
@@ -734,6 +758,7 @@ def build_pseudo_targets(
     thresholds_table,
     class_only_thresholds,
     d_max,
+    distance_conditioning=True,
 ):
     """Eq. 16: acceptance mask A_i and the detached soft teacher target.
 
@@ -760,6 +785,14 @@ def build_pseudo_targets(
         stratum_edges: ``[C, B-1]`` tensor (see ``fit_distance_bins``).
         thresholds_table: ``[C, B]`` tensor, τ_{c,b} (``inf`` = abstain).
         class_only_thresholds, d_max: ``[C]`` tensors.
+        distance_conditioning: when ``False`` (Table 2's "MT, class-only
+            calibration" ablation row, ``paper_icassp2027/main.tex``), the
+            per-(class, distance-stratum) branch is disabled entirely --
+            every candidate is judged solely against
+            ``class_only_thresholds``, i.e. the exact same Wilson-calibrated
+            ``Omega_cal`` evidence as the default, just pooled across
+            distance bins instead of conditioned on them. Default ``True``
+            reproduces the full method (both branches active) unchanged.
     Returns:
         dict with ``target`` (shaped like ``teacher_prob``, detached
         ``sg(q_i)``), ``mask`` (``teacher_prob`` with the class dim replaced
@@ -768,19 +801,24 @@ def build_pseudo_targets(
     if stratum_edges.shape[0] != thresholds_table.shape[0]:
         raise ValueError("stratum_edges/thresholds_table class dimension mismatch")
 
-    distance_ok = torch.isfinite(distance)
-    dmax_for_pred = d_max[teacher_pred]
-    use_distance = distance_ok & torch.isfinite(dmax_for_pred)
-    within_support = use_distance & (distance <= dmax_for_pred)
+    if distance_conditioning:
+        distance_ok = torch.isfinite(distance)
+        dmax_for_pred = d_max[teacher_pred]
+        use_distance = distance_ok & torch.isfinite(dmax_for_pred)
+        within_support = use_distance & (distance <= dmax_for_pred)
 
-    if stratum_edges.shape[1] > 0:
-        local_edges = stratum_edges[teacher_pred]
-        stratum_bin = (distance.unsqueeze(-1) >= local_edges).sum(dim=-1)
+        if stratum_edges.shape[1] > 0:
+            local_edges = stratum_edges[teacher_pred]
+            stratum_bin = (distance.unsqueeze(-1) >= local_edges).sum(dim=-1)
+        else:
+            stratum_bin = torch.zeros_like(teacher_pred)
+        stratum_bin = stratum_bin.clamp(0, thresholds_table.shape[1] - 1)
+        stratum_threshold = thresholds_table[teacher_pred, stratum_bin]
+        distance_branch_accept = within_support & (reliability >= stratum_threshold)
     else:
+        use_distance = torch.zeros_like(teacher_pred, dtype=torch.bool)
+        distance_branch_accept = torch.zeros_like(teacher_pred, dtype=torch.bool)
         stratum_bin = torch.zeros_like(teacher_pred)
-    stratum_bin = stratum_bin.clamp(0, thresholds_table.shape[1] - 1)
-    stratum_threshold = thresholds_table[teacher_pred, stratum_bin]
-    distance_branch_accept = within_support & (reliability >= stratum_threshold)
 
     class_only_threshold = class_only_thresholds[teacher_pred]
     fallback_accept = (~use_distance) & (reliability >= class_only_threshold)
@@ -799,6 +837,77 @@ def build_pseudo_targets(
         "distance_branch_ratio": ((distance_branch_accept & omega_u).float().sum() / denom).detach(),
         "fallback_branch_ratio": ((fallback_accept & omega_u).float().sum() / denom).detach(),
         "stratum_bin": stratum_bin.detach(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ablation-only acceptance rules (Table 2, "Ablating Trust Calibration",
+# ``paper_icassp2027/main.tex``). Neither function is used by the full
+# VoxTrust-3D/DCC method (``build_pseudo_targets`` above); both exist solely
+# so ``voxtrust_step`` can reproduce the "MT, all pseudo-labels" and "MT,
+# global confidence" rows of Table 2 without a separate training script.
+# ---------------------------------------------------------------------------
+
+
+def unconditional_pseudo_targets(teacher_prob, omega_u):
+    """Table 2 row "MT, all pseudo-labels": plain, unfiltered Mean Teacher
+    pseudo-label transfer (Tarvainen & Valpola, 2017) -- every Omega_u
+    candidate is supervised by the teacher's soft prediction, with no
+    reliability filtering and no ``Omega_cal`` evidence consulted at all.
+
+    Shape-agnostic over the spatial rank, matching ``build_pseudo_targets``.
+
+    Args:
+        teacher_prob: ``[B, C, D, H, W]`` or ``[B, C, H, W]`` softmax teacher
+            probabilities.
+        omega_u: real (non-padding) unlabeled candidates, spatial-rank-matched
+            bool tensor.
+    Returns:
+        dict with ``target``/``mask`` shaped like ``build_pseudo_targets``'
+        and ``accepted_ratio`` (1.0 whenever any candidate exists, since
+        nothing is filtered).
+    """
+    mask = omega_u.float().unsqueeze(1).detach()
+    target = teacher_prob.detach()
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    denom = omega_u.float().sum().clamp_min(1.0)
+    return {
+        "target": target,
+        "mask": mask,
+        "accepted_ratio": (omega_u.float().sum() / denom).detach(),
+    }
+
+
+def global_threshold_pseudo_targets(teacher_prob, omega_u, reliability, threshold):
+    """Table 2 row "MT, global confidence": a single, uncalibrated
+    reliability cutoff shared by every class and every distance -- no
+    ``Omega_cal`` evidence is consulted. Contrast with
+    ``build_pseudo_targets``'s per-(class, distance-stratum) Wilson-
+    calibrated threshold, fit from held-out scribble correctness.
+
+    Shape-agnostic over the spatial rank, matching ``build_pseudo_targets``.
+
+    Args:
+        teacher_prob: ``[B, C, D, H, W]`` or ``[B, C, H, W]`` softmax teacher
+            probabilities.
+        omega_u: real (non-padding) unlabeled candidates, spatial-rank-matched
+            bool tensor.
+        reliability: ``R_i`` (see ``reliability_score``), spatial-rank-matched.
+        threshold: a single Python float, the same for every voxel regardless
+            of predicted class or distance.
+    Returns:
+        dict with ``target``/``mask``/``accepted_ratio`` matching
+        ``unconditional_pseudo_targets``.
+    """
+    accept = omega_u & (reliability >= threshold)
+    mask = accept.float().unsqueeze(1).detach()
+    target = teacher_prob.detach()
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    denom = omega_u.float().sum().clamp_min(1.0)
+    return {
+        "target": target,
+        "mask": mask,
+        "accepted_ratio": (accept.float().sum() / denom).detach(),
     }
 
 
