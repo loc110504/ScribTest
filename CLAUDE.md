@@ -9,8 +9,9 @@ Scribble-supervised medical image segmentation benchmark on **ACDC**, **MSCMR**,
 independent **2D slices** (`UNet2D` backbone, the standard protocol in the scribble-supervision
 literature — WSL4MIS, DMSPS, CycleMix, ScribFormer), stitched back into a volume only at
 evaluation time. WORD (abdominal CT, near-isotropic) trains as full **3D volumes** with a `VNet3D`
-backbone. Seven methods share these two pipelines, differing only in how they turn scribbles into a
-loss / pseudo-label:
+backbone. Nine methods share these two pipelines (seven single-dataset run on ACDC/MSCMR/WORD, two
+more -- DMPLS and Bayes-WSS -- are ACDC/MSCMR-only), differing only in how they turn scribbles into
+a loss / pseudo-label:
 
 - **pCE** — partial cross-entropy baseline (loss only on annotated voxels)
 - **CycleMix** (Zhang & Zhuang, CVPR 2022)
@@ -41,10 +42,34 @@ loss / pseudo-label:
   partner and ModelMix does not run on it. See `code/utils/modelmix.py` and
   `train_modelmix_2d.py` (no `--dataset` flag — one run always produces both ACDC's and MSCMR's
   checkpoints).
+- **DMPLS** (Luo et al., MICCAI 2022) — the single-stage predecessor of DMSPS: the same dual-branch
+  pCE + dynamically mixed soft pseudo-label consistency loss, but trained end-to-end in one stage,
+  with no stage-2 uncertainty-guided label expansion. ACDC/MSCMR (2D) only — no WORD/3D pipeline in
+  this benchmark. See `code/utils/dmpls.py` (re-exports the verified `code/utils/dmsps.py`
+  primitives) and `train_dmpls_2d.py`'s module docstring. Checkpoints a dual-decoder `UNetCCT2D`
+  like DMSPS and is evaluated with its own `test_dmpls_2d.py`.
+- **Bayes-WSS** (Zheng et al., MICCAI 2024) — a Bayesian dual-encoder/decoder CVAE models the joint
+  distribution `p(x, y | z)` on the scribble (KL + reconstruction + partial-CE + a local-window
+  DenseCRF regularizer), then its frozen, sample-averaged pseudo-label fills in every unlabeled
+  pixel to train a second, plain `UNet2D` with ordinary cross-entropy. ACDC/MSCMR (2D) only. See
+  `code/networks/bayes_wss_2d.py`, `code/utils/bayes_wss.py` (including the one documented
+  deviation from the official compiled DenseCRF filter), and `train_bayes_wss_2d.py`'s module
+  docstring. The CVAE is training-only and never checkpointed; the deployed `UNet2D` checkpoint is
+  evaluated directly with the shared `test_pce_2d.py`, exactly like pCE/CycleMix/EFFDNet/SDT-Net/
+  ModelMix.
 
 Each single-dataset method has a `train_<method>_2d.py` (ACDC/MSCMR only) and `train_<method>_3d.py`
-(WORD only) script; ModelMix is the one exception (`train_modelmix_2d.py` only, no 3D counterpart).
-All scripts are run from the **repository root**.
+(WORD only) script; ModelMix, DMPLS and Bayes-WSS are the exceptions (`train_modelmix_2d.py`,
+`train_dmpls_2d.py`, `train_bayes_wss_2d.py` — all 2D-only, no 3D counterpart). All scripts are run
+from the **repository root**.
+
+### Fully-supervised (dense-mask) upper bound
+
+`train_fullsup_2d.py` is not a scribble-supervised method — it trains the same `UNet2D` backbone
+directly on `labelsTr_dense` with a plain, unmasked cross-entropy loss, to measure the ceiling every
+scribble-supervised method above is compared against (the "FullSup" row in DMPLS/DMSPS-style
+tables). ACDC/MSCMR (2D) only. Checkpoints a plain `UNet2D`, evaluated with `test_pce_2d.py`. Run
+with `code/train/run_fullsup.sh`.
 
 ### Second ACDC/MSCMR data source: the "expert scribble" archive
 
@@ -85,12 +110,17 @@ python code/test/test_vnet_3d.py           # VNet3D/VNetCCT3D (WORD backbone)
 python code/test/test_scribblebench_2d.py  # ACDC/MSCMR slice dataset + RandomGenerator2D
 python code/test/test_cyclemix_utils.py
 python code/test/test_dmsps_utils.py
+python code/test/test_dmpls_utils.py       # DMPLS training step (re-exports utils/dmsps.py primitives)
+python code/test/test_bayes_wss_utils.py   # Bayes-WSS CVAE network + KL/recon/pCE/local-DenseCRF losses
 python code/test/test_sdtnet_utils.py
 python code/test/test_voxtrust3d_utils.py
 python code/test/test_effdnet_utils.py     # FBSL contrastive loss, FADC augmentation, EMA warm-up
 python code/test/test_modelmix_utils.py    # image/model mixup, encoder layer mixing, rotation
 python code/test/test_train_pce_2d.py      # split resolution, checkpoint round-trip
 python code/test/test_train_dmsps_2d.py    # stage-2 expanded-label dataset wiring
+python code/test/test_train_dmpls_2d.py    # split resolution, checkpoint round-trip (dual-decoder)
+python code/test/test_train_bayes_wss_2d.py  # checkpoint round-trip (plain UNet2D, test_pce_2d-compatible)
+python code/test/test_train_fullsup_2d.py  # checkpoint round-trip (plain UNet2D, dense-mask upper bound)
 python code/test/test_train_voxtrust3d_2d.py  # 2D calibration dataset + full voxtrust_step
 python code/test/test_train_effdnet_3d.py  # full effdnet_step, 2D and 3D
 python code/test/test_train_modelmix_2d.py # full modelmix_task_step, gradient-flow properties
@@ -126,14 +156,24 @@ one run, producing two checkpoints:
 python code/train/train_modelmix_2d.py --amp
 # -> checkpoints/ScribbleBench_ModelMix/ACDC/best.pth and .../MSCMR/best.pth
 ```
+DMPLS and Bayes-WSS are ACDC/MSCMR-only (2D), no `--stage`/`--dataset` restrictions beyond that:
+```bash
+python code/train/train_dmpls_2d.py --dataset ACDC --amp
+python code/train/train_bayes_wss_2d.py --dataset ACDC --amp
+```
+The fully-supervised (dense-mask) upper bound, also ACDC/MSCMR-only:
+```bash
+python code/train/train_fullsup_2d.py --dataset ACDC --amp
+```
 
-Evaluate a checkpoint (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/ModelMix all deploy a plain
-UNet2D/VNet3D checkpoint and share `test_pce_{2d,3d}.py` (default `--eval_target student`; pass
-`--eval_target teacher` for VoxTrust-3D's EMA teacher); DMSPS's dual-decoder network needs
-`test_dmsps_{2d,3d}.py`):
+Evaluate a checkpoint (pCE/CycleMix/SDT-Net/VoxTrust-3D/EFFDNet/ModelMix/Bayes-WSS/FullSup all
+deploy a plain UNet2D/VNet3D checkpoint and share `test_pce_{2d,3d}.py` (default
+`--eval_target student`; pass `--eval_target teacher` for VoxTrust-3D's EMA teacher); DMSPS's and
+DMPLS's dual-decoder networks need `test_dmsps_{2d,3d}.py`/`test_dmpls_2d.py` respectively):
 ```bash
 python code/test/test_pce_2d.py --checkpoint checkpoints/ScribbleBench_pCE/ACDC/best.pth --amp
 python code/test/test_dmsps_3d.py --checkpoint checkpoints/ScribbleBench_DMSPS/WORD/stage2/best.pth --amp
+python code/test/test_dmpls_2d.py --checkpoint checkpoints/ScribbleBench_DMPLS/ACDC/best.pth --amp
 ```
 
 Run everything (train + test all methods x all datasets, one summary CSV; ACDC/MSCMR routed
@@ -145,7 +185,10 @@ Configurable via env vars (`SCRIBBLE_DATASETS`, `SCRIBBLE_BATCH_SIZE`, `SCRIBBLE
 `SCRIBBLE_DEVICE`, `SCRIBBLE_ROOT_PATH`, checkpoint/results root overrides, extra train/test args)
 — see the header comment of `code/train/run_baselines.sh` for the full list, and
 `code/train/run_voxtrust3d.sh` / `run_voxtrust3d_nowarmup.sh` for VoxTrust-3D-only runs with a
-different (no-)warm-up schedule.
+different (no-)warm-up schedule. `run_baselines.sh` does not include DMPLS/Bayes-WSS/FullSup (they
+are ACDC/MSCMR-only, unlike every method already in that sweep's per-dataset loop); run them with
+`code/train/run_dmpls_bayes_wss.sh` and `code/train/run_fullsup.sh` (same env-var conventions,
+same summary CSV by default).
 
 Quick CPU smoke test of the full pipeline (e.g. before a real run):
 ```bash
@@ -207,9 +250,21 @@ code/
                                  # choices restricted)
     train_modelmix_2d.py       # No 3D counterpart; no --dataset flag -- always jointly trains
                                # ACDC+MSCMR, producing two checkpoints in one run
+    train_dmpls_2d.py           # ACDC/MSCMR only, no 3D counterpart; single-stage DMPLS
+                                 # (utils/dmpls.py), dual-decoder UNetCCT2D checkpoint
+    train_bayes_wss_2d.py       # ACDC/MSCMR only, no 3D counterpart; two-stage Bayes-WSS
+                                 # (networks/bayes_wss_2d.py + utils/bayes_wss.py), deploys a
+                                 # plain UNet2D (the CVAE is training-only, never checkpointed)
+    train_fullsup_2d.py         # ACDC/MSCMR only, no 3D counterpart; not scribble-supervised --
+                                 # trains UNet2D directly on labelsTr_dense, the upper-bound baseline
     run_baselines.sh            # Full train+test sweep, all methods x all datasets, routes
                                  # ACDC/MSCMR through *_2d.py and WORD through *_3d.py, plus a
-                                 # separate ModelMix(ACDC+MSCMR) block
+                                 # separate ModelMix(ACDC+MSCMR) block (DMPLS/Bayes-WSS/FullSup are
+                                 # not in this sweep; see run_dmpls_bayes_wss.sh/run_fullsup.sh)
+    run_dmpls_bayes_wss.sh       # Train+test DMPLS and Bayes-WSS on ACDC+MSCMR; mirrors
+                                 # run_baselines.sh's env-var conventions and summary CSV
+    run_fullsup.sh               # Train+test the fully-supervised upper bound on ACDC+MSCMR;
+                                 # mirrors run_baselines.sh's env-var conventions and summary CSV
     run.sh, run_voxtrust3d.sh, run_voxtrust3d_nowarmup.sh,
       run_voxtrust3d_dcc_ablation.sh   # Narrower/variant sweeps
     run_icassp2027_baselines_acdc.sh, run_icassp2027_baselines_mscmr.sh   # paper_icassp2027/
@@ -227,9 +282,12 @@ code/
                                  # ACDC+MSCMR); mirrors run_baselines.sh
   test/
     test_pce_2d.py, test_dmsps_2d.py   # Evaluators for ACDC/MSCMR (per-slice stitch inference) --
-                                        # also used for EFFDNet/ModelMix (plain UNet2D checkpoints);
-                                        # --eval_target {student,teacher} (default student) picks
-                                        # which half of a Mean Teacher checkpoint (VoxTrust-3D) to load
+                                        # also used for EFFDNet/ModelMix/Bayes-WSS/FullSup (plain
+                                        # UNet2D checkpoints); --eval_target {student,teacher}
+                                        # (default student) picks which half of a Mean Teacher
+                                        # checkpoint (VoxTrust-3D) to load
+    test_dmpls_2d.py                    # Evaluator for DMPLS's dual-decoder UNetCCT2D checkpoint,
+                                        # mirrors test_dmsps_2d.py
     test_pce_3d.py, test_dmsps_3d.py   # Evaluators for WORD (sliding-window inference) -- also
                                         # used for EFFDNet (plain VNet3D checkpoint)
     test_pce_2d_expert.py, test_dmsps_2d_expert.py   # Same evaluators, against the expert-scribble
@@ -295,9 +353,11 @@ results/       # metrics.json, baselines_summary.csv / expert_baselines_summary.
   include subject2/subject4 (excluded from ScribbleBench because their dense labels are unavailable
   there); `resolve_case_split` drops them and logs it rather than raising, since -- unlike a missing
   published group -- an *extra* on-disk group is not a broken dataset here.
-- **Checkpoint compatibility**: within one pipeline, pCE, CycleMix, SDT-Net, VoxTrust-3D and
-  EFFDNet all checkpoint a plain `UNet2D`/`VNet3D` and are evaluated with the same
-  `test_pce_{2d,3d}.py`. VoxTrust-3D additionally saves both halves of its Mean Teacher pair
+- **Checkpoint compatibility**: within one pipeline, pCE, CycleMix, SDT-Net, VoxTrust-3D, EFFDNet,
+  Bayes-WSS and FullSup all checkpoint a plain `UNet2D`/`VNet3D` and are evaluated with the same
+  `test_pce_{2d,3d}.py`. DMPLS checkpoints a dual-decoder `UNetCCT2D` like DMSPS and uses its own
+  evaluator, `test_dmpls_2d.py` (mirrors `test_dmsps_2d.py`). VoxTrust-3D additionally saves both
+  halves of its Mean Teacher pair
   (`model_state_dict` = EMA teacher, `student_state_dict` = student); `test_pce_{2d,3d}.py`'s
   `--eval_target` (default `student`) picks which one is evaluated. The default is the student for
   every method here (EFFDNet/SDT-Net already deployed their student; VoxTrust-3D's training script
