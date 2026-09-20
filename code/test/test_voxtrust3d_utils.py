@@ -23,6 +23,7 @@ from utils.voxtrust3d import (
     build_patch_coordinates,
     build_pseudo_targets,
     choose_patch_origin,
+    extrapolate_thresholds,
     fit_distance_bins,
     gather_patch,
     global_threshold_pseudo_targets,
@@ -32,6 +33,7 @@ from utils.voxtrust3d import (
     random_flip_rotate_resize_2d,
     reliability_score,
     scatter_points_into_patch,
+    select_reliability,
     spatially_blocked_partition,
     stable_seed,
     strong_intensity_augment_2d,
@@ -254,6 +256,21 @@ class ReliabilityScoreTests(unittest.TestCase):
             reliability_score(torch.rand(1, 3, 2, 2, 2), torch.rand(1, 2, 2, 2, 2))
 
 
+class SelectReliabilityTests(unittest.TestCase):
+    def test_margin_agreement_returns_score(self):
+        rel = {"score": torch.tensor([0.3]), "teacher_conf": torch.tensor([0.9])}
+        torch.testing.assert_close(select_reliability(rel, "margin_agreement"), rel["score"])
+
+    def test_top1_confidence_returns_teacher_conf(self):
+        rel = {"score": torch.tensor([0.3]), "teacher_conf": torch.tensor([0.9])}
+        torch.testing.assert_close(select_reliability(rel, "top1_confidence"), rel["teacher_conf"])
+
+    def test_unknown_signal_raises(self):
+        rel = {"score": torch.tensor([0.3]), "teacher_conf": torch.tensor([0.9])}
+        with self.assertRaises(ValueError):
+            select_reliability(rel, "bogus")
+
+
 class WilsonLowerBoundTests(unittest.TestCase):
     def test_matches_hand_computed_value(self):
         # p_hat=0.9, n=100, delta=0.05 (z=1.959964) -> LCB ~= 0.826 (standard reference value).
@@ -347,6 +364,59 @@ class RollingCalibrationBufferTests(unittest.TestCase):
         restored.load_state_dict(state)
         self.assertEqual(list(restored._bin_buffer(0, 0)), list(buffer._bin_buffer(0, 0)))
         self.assertEqual(list(restored._class_buffer(1)), list(buffer._class_buffer(1)))
+
+    def test_raw_estimator_accepts_a_cutoff_wilson_would_reject(self):
+        # Table 2's "w/o Wilson bound" row: a small, noisy sample (9/10
+        # correct) clears rho=0.85 at face value (p_hat=0.9) but not through
+        # the Wilson lower bound, which is more conservative at low n.
+        buffer = RollingCalibrationBuffer(num_classes=1, num_strata=1, buffer_size=100, block_cap=100)
+        reliabilities = np.full(10, 0.9)
+        corrects = np.array([1.0] * 9 + [0.0])
+        buffer.update(
+            class_ids=np.zeros(10, dtype=np.int64), bin_ids=np.zeros(10, dtype=np.int64),
+            block_ids=np.arange(10), reliabilities=reliabilities, corrects=corrects,
+        )
+        grid = np.linspace(0.0, 1.0, 101)
+        wilson_thresholds, _ = buffer.fit_thresholds(grid, n_min=5, rho=0.85, delta=0.05, estimator="wilson")
+        raw_thresholds, _ = buffer.fit_thresholds(grid, n_min=5, rho=0.85, delta=0.05, estimator="raw")
+        self.assertTrue(math.isinf(wilson_thresholds[0, 0]))
+        self.assertTrue(math.isfinite(raw_thresholds[0, 0]))
+
+    def test_unknown_estimator_raises(self):
+        buffer = RollingCalibrationBuffer(num_classes=1, num_strata=1, buffer_size=10, block_cap=10)
+        buffer.update(
+            class_ids=np.array([0]), bin_ids=np.array([0]), block_ids=np.array([0]),
+            reliabilities=np.array([0.9]), corrects=np.array([1.0]),
+        )
+        with self.assertRaises(ValueError):
+            buffer.fit_thresholds(np.linspace(0, 1, 11), 1, 0.9, 0.05, estimator="bogus")
+
+
+class ExtrapolateThresholdsTests(unittest.TestCase):
+    def test_fills_abstaining_cell_with_nearest_finite_bin(self):
+        thresholds = np.array([[0.3, math.inf, 0.7]])
+        filled = extrapolate_thresholds(thresholds)
+        # Bin 1 is equidistant from bins 0 and 2; argmin ties keep the first
+        # (lowest-index) match, matching np.argmin's own tie-breaking.
+        self.assertEqual(filled[0, 1], 0.3)
+        self.assertEqual(filled[0, 0], 0.3)
+        self.assertEqual(filled[0, 2], 0.7)
+
+    def test_row_entirely_abstaining_is_left_unchanged(self):
+        thresholds = np.array([[math.inf, math.inf]])
+        filled = extrapolate_thresholds(thresholds)
+        self.assertTrue(np.all(np.isinf(filled)))
+
+    def test_row_with_no_abstention_is_unchanged(self):
+        thresholds = np.array([[0.2, 0.4]])
+        filled = extrapolate_thresholds(thresholds)
+        np.testing.assert_array_equal(filled, thresholds)
+
+    def test_does_not_mutate_input(self):
+        thresholds = np.array([[0.3, math.inf]])
+        original = thresholds.copy()
+        extrapolate_thresholds(thresholds)
+        np.testing.assert_array_equal(thresholds, original)
 
 
 class BinDistanceByClassTests(unittest.TestCase):
@@ -555,6 +625,70 @@ class BuildPseudoTargetsTests(unittest.TestCase):
         )
         self.assertTrue(torch.all(out["mask"] > 0))
         self.assertAlmostEqual(out["fallback_branch_ratio"].item(), 1.0)
+
+    def test_extrapolate_policy_accepts_beyond_d_max(self):
+        # Same setup as test_out_of_support_rejects_even_with_high_reliability
+        # (distance=5.0 > d_max=2.0), but abstain_policy="extrapolate" drops
+        # the d_max cutoff entirely.
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 5.0)
+        thresholds_table = torch.tensor([[0.0], [math.inf]])
+        class_only = torch.tensor([0.0, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+            abstain_policy="extrapolate",
+        )
+        self.assertTrue(torch.all(out["mask"] > 0))
+
+    def test_extrapolate_policy_still_rejects_when_stratum_and_class_only_both_abstain(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 1.0)
+        thresholds_table = torch.tensor([[math.inf], [math.inf]])
+        class_only = torch.tensor([math.inf, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+            abstain_policy="extrapolate",
+        )
+        self.assertTrue(torch.all(out["mask"] == 0))
+
+    def test_extrapolate_policy_falls_back_to_class_only_when_stratum_abstains(self):
+        # Stratum threshold is inf (would abstain) but class_only has
+        # evidence; abstain_policy="extrapolate" should accept via the
+        # class-only fallback instead of rejecting outright.
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 1.0)
+        thresholds_table = torch.tensor([[math.inf], [math.inf]])
+        class_only = torch.tensor([0.5, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        out_abstain = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+            abstain_policy="abstain",
+        )
+        out_extrapolate = build_pseudo_targets(
+            teacher_prob, omega_u, distance, teacher_pred, reliability,
+            stratum_edges, thresholds_table, class_only, d_max,
+            abstain_policy="extrapolate",
+        )
+        self.assertTrue(torch.all(out_abstain["mask"] == 0))
+        self.assertTrue(torch.all(out_extrapolate["mask"] > 0))
+
+    def test_unknown_abstain_policy_raises(self):
+        teacher_prob, teacher_pred, reliability, omega_u, stratum_edges = self._base_tensors()
+        distance = torch.full((1, 1, 1, 3), 1.0)
+        thresholds_table = torch.tensor([[0.0], [math.inf]])
+        class_only = torch.tensor([0.0, math.inf])
+        d_max = torch.tensor([2.0, 2.0])
+        with self.assertRaises(ValueError):
+            build_pseudo_targets(
+                teacher_prob, omega_u, distance, teacher_pred, reliability,
+                stratum_edges, thresholds_table, class_only, d_max,
+                abstain_policy="bogus",
+            )
 
 
 class UnconditionalPseudoTargetsTests(unittest.TestCase):

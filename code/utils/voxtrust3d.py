@@ -54,6 +54,34 @@ pseudo-label transfer. See ``train/train_voxtrust3d_3d.py``'s
 ``code/train/run_voxtrust3d_dcc_ablation.sh`` for the sweep that reproduces
 Table 2.
 
+Design-choice ablation (Table 2's three "w/o ..." rows below the full
+method): three more independent switches, all active only within the
+``full``/``class_only`` branch of ``voxtrust_step`` (they are irrelevant to
+``global_confidence``/``all_pseudo_labels``, which never consult
+``Omega_cal``):
+
+- ``--reliability_signal {margin_agreement, top1_confidence}``: which field
+  of ``reliability_score``'s return dict is used as ``R_i`` everywhere
+  downstream (calibration-buffer updates and the acceptance test alike).
+  ``margin_agreement`` (default) is Eq. 5-7's ``score``. ``top1_confidence``
+  substitutes the teacher's plain top-1 softmax probability
+  (``teacher_conf``), Table 2's "w/o learned signal" row -- isolating
+  whether the calibration mechanism's gain survives a much simpler raw
+  signal. See ``select_reliability`` below.
+- ``--calibration_estimator {wilson, raw}``: which point estimate
+  ``RollingCalibrationBuffer._fit_one`` compares against ``rho`` in Eq. 15.
+  ``wilson`` (default) is the Wilson lower confidence bound. ``raw``
+  substitutes the plain sample ratio ``k/n``, Table 2's "w/o Wilson bound"
+  row -- isolating whether Wilson's small-sample conservatism specifically
+  (not merely consulting held-out evidence at all) is load-bearing.
+- ``--abstain_policy {abstain, extrapolate}``: what happens to a candidate
+  whose per-(class, distance-stratum) cell has no cutoff satisfying
+  ``rho`` (``tau_{c,b}=inf``), or whose distance exceeds that class's
+  ``d_max``. ``abstain`` (default) rejects the candidate outright ("rejected
+  rather than extrapolated"). ``extrapolate`` instead borrows the nearest
+  non-abstaining bin's threshold for that class (``extrapolate_thresholds``)
+  and drops the ``d_max`` cutoff entirely, Table 2's "w/o abstention" row.
+
 This module intentionally has no dataset/I-O code; see
 ``train/train_voxtrust3d_3d.py`` for the training loop that wires these
 pieces to ``dataloader.scribblebench_3d.ScribbleBench3DDataset``.
@@ -438,9 +466,29 @@ def reliability_score(student_prob, teacher_prob, eps=1e-6):
     }
 
 
+RELIABILITY_SIGNALS = ("margin_agreement", "top1_confidence")
+
+
+def select_reliability(rel, signal="margin_agreement"):
+    """Table 2's "w/o learned signal" switch: which field of
+    :func:`reliability_score`'s return dict serves as ``R_i`` everywhere
+    downstream. ``margin_agreement`` (default) is the paper's ``score``
+    (Eq. 5-7); ``top1_confidence`` substitutes the teacher's plain top-1
+    softmax probability, a much simpler raw signal, to test whether the
+    calibration mechanism's gain depends on this specific formula."""
+    if signal == "margin_agreement":
+        return rel["score"]
+    if signal == "top1_confidence":
+        return rel["teacher_conf"]
+    raise ValueError("Unknown reliability_signal: {}".format(signal))
+
+
 # ---------------------------------------------------------------------------
 # Sec. 4.4: class- and distance-conditioned risk calibration (Eq. 9-15)
 # ---------------------------------------------------------------------------
+
+
+CALIBRATION_ESTIMATORS = ("wilson", "raw")
 
 
 def wilson_lower_bound(p_hat, n, delta=0.05):
@@ -543,7 +591,7 @@ class RollingCalibrationBuffer:
                 self._bin_buffer(class_id, bin_id).append(record)
 
     @staticmethod
-    def _fit_one(records, grid, n_min, rho, delta):
+    def _fit_one(records, grid, n_min, rho, delta, estimator="wilson"):
         if len(records) == 0:
             return math.inf
         arr = np.asarray(records, dtype=np.float64)
@@ -556,21 +604,28 @@ class RollingCalibrationBuffer:
         n_t = (n_total - idx).astype(np.float64)
         k_t = suffix_k[idx]
         p_hat = np.divide(k_t, np.maximum(n_t, 1.0))
-        lcb = wilson_lower_bound(p_hat, n_t, delta)
-        feasible = (n_t >= n_min) & (lcb >= rho)
+        if estimator == "wilson":
+            point_estimate = wilson_lower_bound(p_hat, n_t, delta)
+        elif estimator == "raw":
+            # Table 2's "w/o Wilson bound" row: accept a cell's raw sample
+            # ratio k/n at face value, with no small-sample correction.
+            point_estimate = p_hat
+        else:
+            raise ValueError("Unknown calibration_estimator: {}".format(estimator))
+        feasible = (n_t >= n_min) & (point_estimate >= rho)
         satisfying = np.flatnonzero(feasible)
         if satisfying.size == 0:
             return math.inf
         return float(grid[satisfying[0]])
 
-    def fit_thresholds(self, grid, n_min, rho, delta):
+    def fit_thresholds(self, grid, n_min, rho, delta, estimator="wilson"):
         """Eq. 15: returns ``(thresholds[C, B], class_only_thresholds[C])``; ``inf`` abstains."""
         thresholds = np.full((self.num_classes, self.num_strata), math.inf, dtype=np.float64)
         for (class_id, bin_id), buffer in self.per_bin.items():
-            thresholds[class_id, bin_id] = self._fit_one(list(buffer), grid, n_min, rho, delta)
+            thresholds[class_id, bin_id] = self._fit_one(list(buffer), grid, n_min, rho, delta, estimator)
         class_thresholds = np.full(self.num_classes, math.inf, dtype=np.float64)
         for class_id, buffer in self.class_only.items():
-            class_thresholds[class_id] = self._fit_one(list(buffer), grid, n_min, rho, delta)
+            class_thresholds[class_id] = self._fit_one(list(buffer), grid, n_min, rho, delta, estimator)
         return thresholds, class_thresholds
 
     def state_dict(self):
@@ -748,6 +803,38 @@ def trust_advantage_alpha(ema_decay, q_student, q_teacher, min_scale=0.1):
 # ---------------------------------------------------------------------------
 
 
+ABSTAIN_POLICIES = ("abstain", "extrapolate")
+
+
+def extrapolate_thresholds(thresholds):
+    """Table 2's "w/o abstention" row: fill an abstaining (``inf``)
+    per-(class, distance-stratum) cell with the nearest non-abstaining bin's
+    threshold in the same class row, instead of leaving it ``inf``
+    ("rejected rather than extrapolated" -- this is the extrapolating
+    alternative). A class row that abstains in every bin is left unchanged:
+    there is no evidence anywhere in that row to extrapolate from, and
+    ``build_pseudo_targets``'s own class-only fallback (used when the
+    distance itself is undefined) already covers that degenerate case.
+
+    Args:
+        thresholds: ``(num_classes, num_strata)`` float array, τ_{c,b}.
+    Returns:
+        A new array of the same shape; input is not modified in place.
+    """
+    filled = np.array(thresholds, dtype=np.float64, copy=True)
+    num_classes, num_strata = filled.shape
+    bin_ids = np.arange(num_strata)
+    for class_id in range(num_classes):
+        row = thresholds[class_id]
+        finite = bin_ids[np.isfinite(row)]
+        if finite.size == 0 or finite.size == num_strata:
+            continue
+        for bin_id in bin_ids[~np.isfinite(row)]:
+            nearest = finite[np.argmin(np.abs(finite - bin_id))]
+            filled[class_id, bin_id] = row[nearest]
+    return filled
+
+
 def build_pseudo_targets(
     teacher_prob,
     omega_u,
@@ -759,15 +846,17 @@ def build_pseudo_targets(
     class_only_thresholds,
     d_max,
     distance_conditioning=True,
+    abstain_policy="abstain",
 ):
     """Eq. 16: acceptance mask A_i and the detached soft teacher target.
 
-    Distance-defined candidates use the class-and-stratum threshold and are
-    rejected outright when they exceed that class's ``d_max`` ("rejected
-    rather than extrapolated"); candidates whose predicted class has no
-    Omega_sup in this volume (``distance`` is ``NaN``, or that class's
-    ``d_max`` was never observed at all) fall back to the class-only
-    threshold; if that is also unavailable (``inf``), the voxel is rejected.
+    Distance-defined candidates use the class-and-stratum threshold and, by
+    default (``abstain_policy="abstain"``), are rejected outright when they
+    exceed that class's ``d_max`` ("rejected rather than extrapolated");
+    candidates whose predicted class has no Omega_sup in this volume
+    (``distance`` is ``NaN``, or that class's ``d_max`` was never observed
+    at all) fall back to the class-only threshold; if that is also
+    unavailable (``inf``), the voxel is rejected.
 
     Shape-agnostic over the spatial rank (indexing/elementwise only), so this
     is used as-is for both the 3D volume patches below and ACDC/MSCMR's 2D
@@ -783,7 +872,9 @@ def build_pseudo_targets(
         teacher_pred, reliability: spatial-rank-matched tensors, from
             ``reliability_score``.
         stratum_edges: ``[C, B-1]`` tensor (see ``fit_distance_bins``).
-        thresholds_table: ``[C, B]`` tensor, τ_{c,b} (``inf`` = abstain).
+        thresholds_table: ``[C, B]`` tensor, τ_{c,b} (``inf`` = abstain). When
+            ``abstain_policy="extrapolate"``, the caller is expected to have
+            already run this through :func:`extrapolate_thresholds`.
         class_only_thresholds, d_max: ``[C]`` tensors.
         distance_conditioning: when ``False`` (Table 2's "MT, class-only
             calibration" ablation row, ``paper_icassp2027/main.tex``), the
@@ -793,6 +884,15 @@ def build_pseudo_targets(
             ``Omega_cal`` evidence as the default, just pooled across
             distance bins instead of conditioned on them. Default ``True``
             reproduces the full method (both branches active) unchanged.
+        abstain_policy: ``"abstain"`` (default) rejects a candidate farther
+            than its predicted class's ``d_max``, and rejects a candidate
+            whose stratum threshold is still ``inf`` after the caller's own
+            extrapolation choice. ``"extrapolate"`` (Table 2's "w/o
+            abstention" row) drops the ``d_max`` cutoff -- every
+            distance-defined candidate uses its stratum's threshold
+            regardless of how far it is -- and, if that stratum's threshold
+            is still ``inf`` (an entire class row never had any evidence),
+            falls back to ``class_only_thresholds`` rather than rejecting.
     Returns:
         dict with ``target`` (shaped like ``teacher_prob``, detached
         ``sg(q_i)``), ``mask`` (``teacher_prob`` with the class dim replaced
@@ -800,12 +900,18 @@ def build_pseudo_targets(
     """
     if stratum_edges.shape[0] != thresholds_table.shape[0]:
         raise ValueError("stratum_edges/thresholds_table class dimension mismatch")
+    if abstain_policy not in ABSTAIN_POLICIES:
+        raise ValueError("Unknown abstain_policy: {}".format(abstain_policy))
+    reject_beyond_support = abstain_policy == "abstain"
 
     if distance_conditioning:
         distance_ok = torch.isfinite(distance)
         dmax_for_pred = d_max[teacher_pred]
         use_distance = distance_ok & torch.isfinite(dmax_for_pred)
-        within_support = use_distance & (distance <= dmax_for_pred)
+        if reject_beyond_support:
+            within_support = use_distance & (distance <= dmax_for_pred)
+        else:
+            within_support = use_distance
 
         if stratum_edges.shape[1] > 0:
             local_edges = stratum_edges[teacher_pred]
@@ -815,6 +921,12 @@ def build_pseudo_targets(
         stratum_bin = stratum_bin.clamp(0, thresholds_table.shape[1] - 1)
         stratum_threshold = thresholds_table[teacher_pred, stratum_bin]
         distance_branch_accept = within_support & (reliability >= stratum_threshold)
+        if not reject_beyond_support:
+            class_only_threshold_for_pred = class_only_thresholds[teacher_pred]
+            stratum_abstains = within_support & ~torch.isfinite(stratum_threshold)
+            distance_branch_accept = distance_branch_accept | (
+                stratum_abstains & (reliability >= class_only_threshold_for_pred)
+            )
     else:
         use_distance = torch.zeros_like(teacher_pred, dtype=torch.bool)
         distance_branch_accept = torch.zeros_like(teacher_pred, dtype=torch.bool)
