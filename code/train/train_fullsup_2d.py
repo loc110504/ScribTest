@@ -4,14 +4,21 @@
 Identical pipeline to ``train_pce_2d.py`` (same ``UNet2D`` backbone, split
 resolution, augmentation, checkpointing) except the training dataset itself
 is built with ``sup_type="dense"`` -- every pixel of ``labelsTr_dense`` (not
-just the scribble strokes in ``labelsTr``) supervises the network with a
-plain, unmasked cross-entropy loss. This is the standard "Fully-Supervised"
-upper-bound row reported alongside scribble-supervised methods in the
-literature this benchmark follows (e.g. DMPLS/DMSPS Table 1's ``FullSup``
-row). Unlike every other method in this benchmark, ``labelsTr_dense`` here
-*is* the optimization target, not just the model-selection signal -- by
-design, since this script measures the ceiling scribble-supervised methods
-are compared against, not a scribble-supervised method itself.
+just the scribble strokes in ``labelsTr``) supervises the network with an
+unmasked, unweighted compound loss, cross-entropy plus soft Dice
+(``loss = ce + dice``, both terms over all classes including background).
+This is the same CE+Dice combination ``utils/sdtnet.py``'s ``soft_dice_loss``
+already backs in ``train_modelmix_2d.py``/``train_sdtnet_3d.py`` (see that
+docstring for why it, not ``utils/losses.py``'s ``pDLoss``, is the safe
+choice), reused here unweighted and with no ``ignore_index`` masking effect
+in practice since ``labelsTr_dense`` never contains the dataset's
+``ignore_index`` value. This is the standard "Fully-Supervised" upper-bound
+row reported alongside scribble-supervised methods in the literature this
+benchmark follows (e.g. DMPLS/DMSPS Table 1's ``FullSup`` row). Unlike every
+other method in this benchmark, ``labelsTr_dense`` here *is* the optimization
+target, not just the model-selection signal -- by design, since this script
+measures the ceiling scribble-supervised methods are compared against, not a
+scribble-supervised method itself.
 
 The held-out validation split (dense-label Dice, same patient-level holdout
 as every other method) and the official ``imagesTs``/``labelsTs`` test split
@@ -50,6 +57,7 @@ from train.common_3d import (  # noqa: E402
     seed_worker,
 )
 from train.train_pce_2d import build_val_dataset, resolve_case_split  # noqa: E402
+from utils.sdtnet import soft_dice_loss  # noqa: E402
 
 SUPPORTED_DATASETS = ("ACDC", "MSCMR")
 DEFAULTS = {
@@ -218,6 +226,7 @@ def train(args):
         raise RuntimeError("training loader is empty")
 
     num_classes = train_dataset.num_classes
+    ignore_index = DATASET_CONFIGS[args.dataset]["ignore_index"]
     model = UNet2D(
         in_chns=1,
         class_num=num_classes,
@@ -261,16 +270,24 @@ def train(args):
                 )
                 with amp_context:
                     logits = model(image)
-                    loss = F.cross_entropy(logits, target)
+                    probs = F.softmax(logits, dim=1)
+                    loss_ce = F.cross_entropy(logits, target)
+                    loss_dice = soft_dice_loss(probs, target, num_classes, ignore_index)
+                    loss = loss_ce + loss_dice
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 step += 1
 
-                writer.add_scalar("train/ce", loss.item(), step)
+                writer.add_scalar("train/ce", loss_ce.item(), step)
+                writer.add_scalar("train/dice", loss_dice.item(), step)
+                writer.add_scalar("train/total", loss.item(), step)
                 writer.add_scalar("train/learning_rate", lr, step)
                 if step % 20 == 0:
-                    logging.info("iteration=%d/%d CE=%.6f lr=%.6g", step, args.max_iterations, loss.item(), lr)
+                    logging.info(
+                        "iteration=%d/%d CE=%.6f Dice=%.6f total=%.6f lr=%.6g",
+                        step, args.max_iterations, loss_ce.item(), loss_dice.item(), loss.item(), lr,
+                    )
 
                 should_checkpoint = (
                     checkpoint_due(step, args.late_phase_start, args.early_interval, args.late_interval)

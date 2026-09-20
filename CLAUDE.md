@@ -66,7 +66,9 @@ from the **repository root**.
 ### Fully-supervised (dense-mask) upper bound
 
 `train_fullsup_2d.py` is not a scribble-supervised method — it trains the same `UNet2D` backbone
-directly on `labelsTr_dense` with a plain, unmasked cross-entropy loss, to measure the ceiling every
+directly on `labelsTr_dense` with an unmasked, unweighted compound cross-entropy + soft Dice loss
+(`loss = ce + dice`, via `utils/sdtnet.py`'s `soft_dice_loss`, the same CE+Dice combination
+`train_modelmix_2d.py`/`train_sdtnet_3d.py` already use), to measure the ceiling every
 scribble-supervised method above is compared against (the "FullSup" row in DMPLS/DMSPS-style
 tables). ACDC/MSCMR (2D) only. Checkpoints a plain `UNet2D`, evaluated with `test_pce_2d.py`. Run
 with `code/train/run_fullsup.sh`.
