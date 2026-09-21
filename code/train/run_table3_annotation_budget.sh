@@ -37,6 +37,16 @@
 #
 # Environment variable overrides (all optional):
 #   SCRIBBLE_DATASETS                space-separated subset, default "ACDC" (Table 3's own scope)
+# Resumable: before (re)training each arm, checks whether its checkpoint
+# already ran to completion (last.pth's global_step reached --max_iterations).
+# If so, training is skipped; if a cached metrics.json also already exists
+# for it, evaluation is skipped too (reused instead of re-running the
+# evaluator). If the checkpoint is missing/partial (e.g. an interrupted
+# previous run), its ckpt_dir/results_dir are removed and the arm is
+# trained+evaluated from scratch -- a partial checkpoint would otherwise
+# make guard_fresh_output_dir (common_3d.py) refuse the retry. Safe to
+# Ctrl-C and rerun this script.
+#
 #   SCRIBBLE_HOLDOUT_FRACTIONS       space-separated eta values, default "0.05 0.15 0.30"
 #   SCRIBBLE_SEED                    default 2026; SAME seed used for every arm and for the pixel-fraction statistic
 #   SCRIBBLE_MAX_ITERATIONS          default 30000; forwarded as --max_iterations to every arm
@@ -64,6 +74,11 @@
 #   bash code/train/run_table3_annotation_budget.sh
 
 set -euo pipefail
+shopt -s inherit_errexit  # without this, `set -e` does not propagate into
+                          # command substitutions (e.g. evaluate()'s output
+                          # captured below), so a crash inside evaluate()
+                          # would otherwise be silently swallowed and only
+                          # surface later as a confusing empty-string error
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/../.." && pwd)"
@@ -88,18 +103,71 @@ results_root="${SCRIBBLE_TABLE3_RESULTS_ROOT:-$repo_dir/results}"
 csv_path="${SCRIBBLE_TABLE3_CSV:-$results_root/table3_annotation_budget_summary.csv}"
 namespace="ScribbleBench_VoxTrust3D_table3_budget"
 
-evaluate() {
-  # args: ckpt_dir results_dir -> prints "dice pl_acc pl_cov" (pl_* may be "null")
-  local ckpt_dir="$1" results_dir="$2"
-  python "$test_dir/test_voxtrust3d_ablation_2d.py" \
-    --checkpoint "$ckpt_dir/best.pth" --output_dir "$results_dir" \
-    $device_flag $root_path_flag $extra_eval_args >&2
+# True iff ckpt_dir holds a checkpoint that ran to completion (last.pth's
+# global_step reached its own recorded --max_iterations), not just a
+# best.pth/last.pth pair left behind by a run that was interrupted partway.
+is_checkpoint_complete() {
+  local ckpt_dir="$1"
+  [ -f "$ckpt_dir/best.pth" ] && [ -f "$ckpt_dir/last.pth" ] || return 1
+  python - "$ckpt_dir/last.pth" <<'PYEOF'
+import sys
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu")
+step = checkpoint.get("global_step")
+max_iterations = checkpoint.get("args", {}).get("max_iterations")
+complete = step is not None and max_iterations is not None and step >= max_iterations
+raise SystemExit(0 if complete else 1)
+PYEOF
+}
+
+# args: train_fn dataset eta ckpt_dir results_dir
+# Skips training entirely when ckpt_dir already holds a completed checkpoint
+# (safe to Ctrl-C and rerun this script). Otherwise removes any partial/stale
+# ckpt_dir/results_dir first -- guard_fresh_output_dir (common_3d.py) refuses
+# a fresh training run into a non-empty --output_dir, so a half-finished
+# checkpoint would otherwise block the retry rather than get replaced by it.
+ensure_trained() {
+  local train_fn="$1" dataset="$2" eta="$3" ckpt_dir="$4" results_dir="$5"
+  if is_checkpoint_complete "$ckpt_dir"; then
+    echo "=== [$train_fn] dataset=$dataset eta=$eta: checkpoint at $ckpt_dir already complete -- skipping training ===" >&2
+    return
+  fi
+  if [ -e "$ckpt_dir" ] || [ -e "$results_dir" ]; then
+    echo "Incomplete/stale checkpoint at $ckpt_dir -- removing checkpoint+results and retraining from scratch" >&2
+    rm -rf "$ckpt_dir" "$results_dir"
+  fi
+  "$train_fn" "$dataset" "$eta" "$ckpt_dir"
+}
+
+# args: results_dir -> prints "dice pl_acc pl_cov" and succeeds iff a
+# metrics.json is already there (a completed prior evaluation to reuse).
+read_cached_metrics() {
+  local results_dir="$1"
+  [ -f "$results_dir/metrics.json" ] || return 1
   python - "$results_dir/metrics.json" <<'PYEOF'
 import json, sys
 with open(sys.argv[1]) as handle:
     payload = json.load(handle)
 print(payload["mean_dice"], payload["pl_acc"], payload["pl_cov"])
 PYEOF
+}
+
+evaluate() {
+  # args: ckpt_dir results_dir -> prints "dice pl_acc pl_cov" (pl_* may be "null")
+  # Reuses a cached metrics.json when present instead of re-running the
+  # (slow) evaluator, so a rerun of this script after a fully completed
+  # prior run is a fast no-op.
+  local ckpt_dir="$1" results_dir="$2"
+  local cached
+  if cached="$(read_cached_metrics "$results_dir")"; then
+    echo "$cached"
+    return
+  fi
+  python "$test_dir/test_voxtrust3d_ablation_2d.py" \
+    --checkpoint "$ckpt_dir/best.pth" --output_dir "$results_dir" \
+    $device_flag $root_path_flag $extra_eval_args >&2
+  read_cached_metrics "$results_dir"
 }
 
 train_scribcal_full() {
@@ -174,14 +242,16 @@ for dataset in "${datasets[@]}"; do
       full_ckpt_dir="$table2_checkpoint_root/ScribbleBench_VoxTrust3D_table2_ablation/$dataset/scribcal_full"
       matched_ckpt_dir="$table2_checkpoint_root/ScribbleBench_VoxTrust3D_table2_ablation/$dataset/mt_matched_all_pl"
     else
-      train_scribcal_full "$dataset" "$eta" "$full_ckpt_dir"
-      train_mt_matched "$dataset" "$eta" "$matched_ckpt_dir"
+      ensure_trained train_scribcal_full "$dataset" "$eta" "$full_ckpt_dir" "$full_results_dir"
+      ensure_trained train_mt_matched "$dataset" "$eta" "$matched_ckpt_dir" "$matched_results_dir"
     fi
 
     echo "=== [scribcal_full] dataset=$dataset eta=$eta: evaluate ===" >&2
-    read -r full_dice full_pl_acc full_pl_cov <<< "$(evaluate "$full_ckpt_dir" "$full_results_dir")"
+    full_eval_out="$(evaluate "$full_ckpt_dir" "$full_results_dir")"
+    read -r full_dice full_pl_acc full_pl_cov <<< "$full_eval_out"
     echo "=== [mt_matched] dataset=$dataset eta=$eta: evaluate ===" >&2
-    read -r matched_dice matched_pl_acc matched_pl_cov <<< "$(evaluate "$matched_ckpt_dir" "$matched_results_dir")"
+    matched_eval_out="$(evaluate "$matched_ckpt_dir" "$matched_results_dir")"
+    read -r matched_dice matched_pl_acc matched_pl_cov <<< "$matched_eval_out"
 
     delta_dice=$(python -c "print(round((float(\"$full_dice\") - float(\"$matched_dice\")) * 100, 4))")
 

@@ -335,9 +335,9 @@ def evaluate(args):
             scribble_slice = scribble[d]
             omega_u_native = scribble_slice == ignore_index
             candidate_total += int(omega_u_native.sum())
-            omega_u_t = torch.from_numpy(omega_u_native).unsqueeze(0)
-            teacher_prob_t = torch.from_numpy(teacher_prob_native).unsqueeze(0)
-            student_prob_t = torch.from_numpy(student_prob_native).unsqueeze(0)
+            omega_u_t = torch.from_numpy(omega_u_native).unsqueeze(0).to(device)
+            teacher_prob_t = torch.from_numpy(teacher_prob_native).unsqueeze(0).to(device)
+            student_prob_t = torch.from_numpy(student_prob_native).unsqueeze(0).to(device)
 
             if row_kind == "all_pseudo_labels":
                 pseudo = unconditional_pseudo_targets(teacher_prob_t, omega_u_t)
@@ -357,12 +357,12 @@ def evaluate(args):
                 coord_h, coord_w = np.indices((height, width))
                 coord_batch = np.stack([coord_h, coord_w], axis=0)[None].astype(np.int64)
                 distance_np = batch_transfer_distance(
-                    teacher_pred_t.numpy(), coord_batch, omega_u_native[None], [tree], in_plane_spacing[None]
+                    teacher_pred_t.cpu().numpy(), coord_batch, omega_u_native[None], [tree], in_plane_spacing[None]
                 )
                 pseudo = build_pseudo_targets(
                     teacher_prob=teacher_prob_t,
                     omega_u=omega_u_t,
-                    distance=torch.from_numpy(distance_np),
+                    distance=torch.from_numpy(distance_np).to(device),
                     teacher_pred=teacher_pred_t,
                     reliability=reliability_t,
                     stratum_edges=edges_t,
@@ -373,7 +373,7 @@ def evaluate(args):
                     abstain_policy=cfg["abstain_policy"],
                 )
 
-            accept_native = pseudo["mask"].squeeze(0).squeeze(0).bool().numpy()
+            accept_native = pseudo["mask"].squeeze(0).squeeze(0).bool().cpu().numpy()
             accepted_total += int(accept_native.sum())
             accepted_correct += int((accept_native & correct_native).sum())
 

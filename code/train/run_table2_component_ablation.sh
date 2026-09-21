@@ -45,6 +45,15 @@
 #     wo_wilson, wo_abstain, top1_confidence}/
 # and appends one row per arm x dataset to one summary CSV.
 #
+# Resumable: before (re)training each arm, checks whether its checkpoint
+# already ran to completion (last.pth's global_step reached --max_iterations)
+# AND its evaluation already produced a metrics.json. If both are already
+# done, that arm is skipped entirely (no retraining, no re-evaluation). If
+# the checkpoint is missing/partial (e.g. an interrupted previous run), its
+# ckpt_dir/results_dir are removed and the arm is trained+evaluated from
+# scratch -- a partial checkpoint would otherwise make guard_fresh_output_dir
+# (common_3d.py) refuse the retry. Safe to Ctrl-C and rerun this script.
+#
 # Environment variable overrides (all optional):
 #   SCRIBBLE_DATASETS                space-separated subset, default "ACDC" (Table 2's own scope)
 #   SCRIBBLE_SEED                    default 2026; SAME seed used for every arm
@@ -93,6 +102,42 @@ results_root="${SCRIBBLE_TABLE2_RESULTS_ROOT:-$repo_dir/results}"
 csv_path="${SCRIBBLE_TABLE2_CSV:-$results_root/table2_ablation_summary.csv}"
 namespace="ScribbleBench_VoxTrust3D_table2_ablation"
 
+# True iff ckpt_dir holds a checkpoint that ran to completion (last.pth's
+# global_step reached its own recorded --max_iterations), not just a
+# best.pth/last.pth pair left behind by a run that was interrupted partway.
+is_checkpoint_complete() {
+  local ckpt_dir="$1"
+  [ -f "$ckpt_dir/best.pth" ] && [ -f "$ckpt_dir/last.pth" ] || return 1
+  python - "$ckpt_dir/last.pth" <<'PYEOF'
+import sys
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu")
+step = checkpoint.get("global_step")
+max_iterations = checkpoint.get("args", {}).get("max_iterations")
+complete = step is not None and max_iterations is not None and step >= max_iterations
+raise SystemExit(0 if complete else 1)
+PYEOF
+}
+
+# True iff this arm's training AND evaluation already finished, in which
+# case the caller should skip it entirely instead of retraining. Otherwise
+# wipes ckpt_dir/results_dir so a retry starts clean -- guard_fresh_output_dir
+# (common_3d.py) refuses a fresh training run into a non-empty --output_dir,
+# so a half-finished checkpoint would otherwise block the retry rather than
+# get replaced by it.
+is_arm_complete() {
+  local ckpt_dir="$1" results_dir="$2"
+  if is_checkpoint_complete "$ckpt_dir" && [ -f "$results_dir/metrics.json" ]; then
+    return 0
+  fi
+  if [ -e "$ckpt_dir" ] || [ -e "$results_dir" ]; then
+    echo "Incomplete/stale run at $ckpt_dir -- removing and retraining from scratch" >&2
+    rm -rf "$ckpt_dir" "$results_dir"
+  fi
+  return 1
+}
+
 evaluate_and_append() {
   # args: dataset configuration_label ckpt_dir results_dir
   local dataset="$1" configuration="$2" ckpt_dir="$3" results_dir="$4"
@@ -114,6 +159,11 @@ run_voxtrust_arm() {
   ckpt_dir="$checkpoint_root/$namespace/$dataset/$stage_label"
   results_dir="$results_root/$namespace/$dataset/$stage_label"
 
+  if is_arm_complete "$ckpt_dir" "$results_dir"; then
+    echo "=== [$stage_label] dataset=$dataset: already trained+evaluated -- skipping ===" >&2
+    return
+  fi
+
   echo "=== [$stage_label] dataset=$dataset ablation=$ablation eta=$eta seed=$seed" \
        "max_iterations=$max_iterations: train ==="
   python "$script_dir/train_voxtrust3d_2d.py" --dataset "$dataset" --seed "$seed" --ta_ema 0 \
@@ -131,6 +181,11 @@ run_insample_arm() {
   ckpt_dir="$checkpoint_root/$namespace/$dataset/$stage_label"
   results_dir="$results_root/$namespace/$dataset/$stage_label"
 
+  if is_arm_complete "$ckpt_dir" "$results_dir"; then
+    echo "=== [$stage_label] dataset=$dataset: already trained+evaluated -- skipping ===" >&2
+    return
+  fi
+
   echo "=== [$stage_label] dataset=$dataset eta=$holdout_fraction seed=$seed" \
        "max_iterations=$max_iterations: train ==="
   python "$script_dir/train_voxtrust3d_2d_ablation_insample.py" --dataset "$dataset" --seed "$seed" \
@@ -147,6 +202,11 @@ run_knockout_arm() {
   local ckpt_dir results_dir
   ckpt_dir="$checkpoint_root/$namespace/$dataset/$stage_label"
   results_dir="$results_root/$namespace/$dataset/$stage_label"
+
+  if is_arm_complete "$ckpt_dir" "$results_dir"; then
+    echo "=== [$stage_label] dataset=$dataset: already trained+evaluated -- skipping ===" >&2
+    return
+  fi
 
   echo "=== [$stage_label] dataset=$dataset eta=$holdout_fraction seed=$seed" \
        "max_iterations=$max_iterations: train ==="
