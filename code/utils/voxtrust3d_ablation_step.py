@@ -34,6 +34,19 @@ project's own extension to the base method (see
 ``utils/voxtrust3d.py``'s module docstring), not one of the three
 mechanisms Table 2 ablates, so every ablation script built on this module
 trains with a fixed-rate EMA teacher update only.
+
+:func:`voxtrust_step_in_sample_class_only` is Table 2's ninth row,
+"In-sample, class-only" -- the one ladder arm the original four
+``--ablation`` choices in ``train_voxtrust3d_3d.py``/``train_voxtrust3d_2d.py``
+never covered. It is a faithful copy of ``voxtrust_step``'s ``"class_only"``
+branch (``distance_conditioning=False``, Wilson bound, abstain,
+margin-agreement signal -- i.e. identical to the "Held-out, class-only" row
+in every respect) except the calibration buffer's ``(R_i, correct)`` records
+are read from ``Omega_sup`` -- the pixels the student is *directly* trained
+on -- instead of the withheld ``Omega_cal``, isolating whether calibrating
+against evidence the student never fits (held-out) differs from calibrating
+against evidence it does (in-sample). See that function's own docstring for
+the two accepted simplifications this evidence swap implies.
 """
 
 import numpy as np
@@ -187,4 +200,156 @@ def voxtrust_step_knockout(
     return loss_scrib, loss_pl, diagnostics
 
 
-__all__ = ["voxtrust_step_knockout"]
+def voxtrust_step_in_sample_class_only(
+    model,
+    model_ema,
+    batch,
+    device,
+    ignore_index,
+    case_trees,
+    edges_t,
+    d_max_t,
+    calibrator,
+    grid,
+    args,
+    calibration_active,
+    augment_fn,
+):
+    """Table 2's "In-sample, class-only" row (see module docstring).
+
+    Identical to the held-out class-only arm (Wilson bound, abstain,
+    margin-agreement signal, ``distance_conditioning=False``) except the
+    calibration buffer is fed from ``Omega_sup`` instead of ``Omega_cal``.
+    Everything else -- ``Omega_u``'s definition (still excludes both
+    ``Omega_sup`` and ``Omega_cal``), buffer size, Wilson bound -- matches
+    the held-out arm exactly, so a Dice/PL-Acc/PL-Cov difference between the
+    two rows isolates the evidence source alone.
+
+    Two accepted simplifications, both a direct consequence of sourcing
+    ``Omega_sup`` instead of ``Omega_cal``, documented rather than worked
+    around:
+
+    - ``Omega_sup`` has no per-pixel ``block_id`` the way ``Omega_cal`` does
+      (``spatially_blocked_partition`` only tracks block ids for the
+      held-out side, via ``cal_block_id``/``batch["cal_block"]``). Each
+      in-sample record is therefore capped as its own singleton block
+      (``block_ids = arange(...)``), so ``RollingCalibrationBuffer``'s
+      per-block cap never binds for this arm -- a strictly looser cap than
+      the held-out arm's, not a tighter one, so it cannot be the source of
+      any accuracy advantage this row shows.
+    - The transfer-distance KD-tree is itself built from ``Omega_sup``, so
+      querying it AT ``Omega_sup`` pixels returns distance 0 for essentially
+      every record (a pixel's nearest same-class ``Omega_sup`` neighbour is
+      typically inside its own stroke). In-sample evidence therefore
+      collapses almost entirely into the nearest distance stratum -- an
+      accurate reflection of the evidence, not a bug -- which does not
+      affect this arm's acceptance decision, since class-only pooling never
+      consults the per-stratum threshold table anyway.
+    """
+    weak_batch = batch["image"].to(device, non_blocking=True)
+    sup_label = batch["sup_label"].to(device, non_blocking=True).long()
+    cal_label = batch["cal_label"].to(device, non_blocking=True).long()
+    coord_np = batch["coord"].numpy()
+    spacing_np = batch["spacing"].numpy()
+    cases = batch["case"]
+
+    student_batch = augment_fn(weak_batch, args) if args.use_strong_aug else weak_batch
+
+    with torch.no_grad():
+        teacher_logits = model_ema(weak_batch)
+        teacher_prob = F.softmax(teacher_logits, dim=1)
+
+    student_logits = model(student_batch)
+    student_prob = F.softmax(student_logits, dim=1)
+
+    # Eq. 4: partial CE over Omega_sup only.
+    loss_scrib, sup_voxels = partial_cross_entropy(student_logits, sup_label, ignore_index)
+
+    loss_pl = student_logits.new_tensor(0.0)
+    diagnostics = {"sup_voxels": sup_voxels.item(), "ema_alpha": args.ema_decay}
+
+    if not calibration_active:
+        return loss_scrib, loss_pl, diagnostics
+
+    rel = reliability_score(student_prob, teacher_prob)
+    teacher_pred = rel["teacher_pred"]
+    reliability = select_reliability(rel, "margin_agreement")
+    omega_u = (sup_label == ignore_index) & (cal_label == ignore_index) & (batch["coord"][:, 0].to(device) >= 0)
+
+    teacher_pred_np = teacher_pred.detach().cpu().numpy()
+    sup_valid = (sup_label != ignore_index).detach().cpu().numpy()
+    omega_u_np = omega_u.detach().cpu().numpy()
+    candidate_np = sup_valid | omega_u_np
+
+    case_trees_batch = [case_trees[case] for case in cases]
+    distance_np = batch_transfer_distance(teacher_pred_np, coord_np, candidate_np, case_trees_batch, spacing_np)
+    distance = torch.from_numpy(distance_np).to(device)
+
+    # ---- calibration update on Omega_sup (in-sample evidence) ----
+    true_label_np = sup_label.detach().cpu().numpy()
+    score_np = reliability.detach().cpu().numpy()
+    d_max_np = d_max_t.detach().cpu().numpy()
+    edges_np = edges_t.detach().cpu().numpy()
+
+    if sup_valid.any():
+        class_ids = teacher_pred_np[sup_valid]
+        correct = (teacher_pred_np[sup_valid] == true_label_np[sup_valid]).astype(np.float64)
+        reliabilities = score_np[sup_valid]
+        block_ids = np.arange(len(class_ids))  # singleton blocks; see docstring
+        record_distance = distance_np[sup_valid]
+
+        bin_ids = np.full(len(class_ids), -1, dtype=np.int64)
+        dmax_for_class = d_max_np[class_ids]
+        use_distance = np.isfinite(record_distance) & np.isfinite(dmax_for_class)
+        within_support = use_distance & (record_distance <= dmax_for_class)
+        if edges_np.shape[1] > 0:
+            local_edges = edges_np[class_ids]
+            stratum = (record_distance[:, None] >= local_edges).sum(axis=1)
+        else:
+            stratum = np.zeros(len(class_ids), dtype=np.int64)
+        bin_ids[within_support] = stratum[within_support]
+
+        calibrator.update(
+            class_ids=class_ids,
+            bin_ids=bin_ids,
+            block_ids=block_ids,
+            reliabilities=reliabilities,
+            corrects=correct,
+        )
+
+    thresholds_np, class_only_np = calibrator.fit_thresholds(
+        grid, args.calibration_min_samples, args.target_precision, args.wilson_delta, estimator="wilson",
+    )
+    thresholds_t = torch.from_numpy(thresholds_np).float().to(device)
+    class_only_t = torch.from_numpy(class_only_np).float().to(device)
+
+    # ---- pseudo-label on Omega_u, class-only pooling (distance_conditioning=False) ----
+    pseudo = build_pseudo_targets(
+        teacher_prob=teacher_prob,
+        omega_u=omega_u,
+        distance=distance,
+        teacher_pred=teacher_pred,
+        reliability=reliability,
+        stratum_edges=edges_t,
+        thresholds_table=thresholds_t,
+        class_only_thresholds=class_only_t,
+        d_max=d_max_t,
+        distance_conditioning=False,
+        abstain_policy="abstain",
+    )
+    loss_pl = masked_soft_ce_loss(student_logits, pseudo["target"], pseudo["mask"])
+
+    diagnostics.update(
+        {
+            "reliability_mean": reliability.mean().item(),
+            "margin_mean": rel["margin"].mean().item(),
+            "stability_mean": rel["stability"].mean().item(),
+            "accepted_ratio": pseudo["accepted_ratio"].item(),
+            "fallback_branch_ratio": pseudo["fallback_branch_ratio"].item(),
+            "finite_class_only_thresholds": int(np.isfinite(class_only_np).sum()),
+        }
+    )
+    return loss_scrib, loss_pl, diagnostics
+
+
+__all__ = ["voxtrust_step_knockout", "voxtrust_step_in_sample_class_only"]

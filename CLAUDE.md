@@ -144,6 +144,8 @@ python code/test/test_train_voxtrust3d_2d.py  # 2D calibration dataset + full vo
 python code/test/test_train_effdnet_3d.py  # full effdnet_step, 2D and 3D
 python code/test/test_train_modelmix_2d.py # full modelmix_task_step, gradient-flow properties
 python code/test/test_nesyscrib_utils.py   # rule bank, symbolic repair, reliability, full nesyscrib_step
+python code/test/test_voxtrust3d_ablation_step.py  # Table 2's design-choice knockouts + in-sample/held-out evidence split
+python code/test/test_compute_holdout_pixel_fraction.py  # Table 3's realized held-out pixel fraction statistic
 python code/test/test_train_nesyscrib_2d.py  # checkpoint round-trip (Mean-Teacher pair, test_pce_2d-compatible)
 python code/test/test_common_2d.py         # per-slice resize-then-stitch inference/validation
 python code/test/test_common_3d.py
@@ -300,7 +302,26 @@ code/
     run_nesyscrib.sh              # Train+test NeSy-Scrib on ACDC+MSCMR; mirrors run_baselines.sh's
                                  # env-var conventions and summary CSV
     run.sh, run_voxtrust3d.sh, run_voxtrust3d_nowarmup.sh,
-      run_voxtrust3d_dcc_ablation.sh   # Narrower/variant sweeps
+      run_voxtrust3d_dcc_ablation.sh, run_voxtrust3d_dcc_full_ablation_2d.sh   # Narrower/variant sweeps;
+                                 # the latter reproduces paper_icassp2027/main.tex's Table 2
+                                 # ("Ablating Trust Calibration") minus its "In-sample, class-only"
+                                 # row (see below), via test_voxtrust3d_ablation_2d.py's Dice/PL-Acc/
+                                 # PL-Cov replay and the *_ablation_{raw_ratio,extrapolate,top1conf}.py
+                                 # design-choice knockouts
+    run_table2_component_ablation.sh   # Full 9-row Table 2 (adds the "In-sample, class-only" row via
+                                 # train_voxtrust3d_2d_ablation_insample.py; own checkpoint/results
+                                 # namespace, does not reuse run_voxtrust3d_dcc_full_ablation_2d.sh's)
+    run_table3_annotation_budget.sh   # Table 3 ("Annotation-allocation study"): eta in {5,15,30}%,
+                                 # ScribCal (full) vs. a matched Mean Teacher control per eta, plus
+                                 # the realized held-out pixel fraction via
+                                 # code/test/compute_holdout_pixel_fraction.py (a pure data
+                                 # statistic, no training)
+    train_voxtrust3d_2d_ablation_insample.py   # Table 2's "In-sample, class-only" row: standalone
+                                 # copy of train_voxtrust3d_2d.py using
+                                 # utils/voxtrust3d_ablation_step.py's
+                                 # voxtrust_step_in_sample_class_only (calibration evidence read
+                                 # from Omega_sup instead of Omega_cal, everything else matching the
+                                 # "Held-out, class-only" arm)
     run_icassp2027_baselines_acdc.sh, run_icassp2027_baselines_mscmr.sh   # paper_icassp2027/
                                  # main.tex's Table 1 baselines only (excludes WORD), one script
                                  # per dataset; append to the same results CSV by default
@@ -330,6 +351,11 @@ code/
     metrics_3d.py                       # Dice / HD95 / ASSD -- dimension-agnostic, shared by all
                                          # evaluators above
     append_metrics_csv.py               # Appends one evaluator run's metrics to the summary CSV
+    test_voxtrust3d_ablation_2d.py      # Dice/PL-Acc/PL-Cov replay for every Table 2 row (held-out
+                                         # validation split); append_ablation_csv.py appends its rows
+    compute_holdout_pixel_fraction.py   # Table 3's realized held-out pixel fraction at a given eta
+                                         # (pure data statistic via spatially_blocked_partition, no
+                                         # model/training involved)
     test_*.py                           # Unit tests (CPU, fast)
 
 dataset/ScribbleBench/<ACDC|MSCMR|WORD>/   # Not committed to git

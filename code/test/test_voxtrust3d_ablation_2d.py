@@ -118,6 +118,14 @@ ABLATION_ROW_CONFIG = {
     "voxtrust3d_ablation_top1conf": {
         "ablation": "full", "estimator": "wilson", "abstain_policy": "abstain", "signal": "top1_confidence",
     },
+    # Table 2's "In-sample, class-only" row (train_voxtrust3d_2d_ablation_insample.py):
+    # replays exactly like "Held-out, class-only" (class_only ablation, wilson/abstain/
+    # margin_agreement) -- the evidence-source swap (Omega_sup vs Omega_cal) only
+    # affected which records went into calibrator_state at TRAINING time; refitting
+    # thresholds from whatever is in that buffer is identical code either way.
+    "voxtrust3d_ablation_in_sample_class_only": {
+        "ablation": "class_only", "estimator": "wilson", "abstain_policy": "abstain", "signal": "margin_agreement",
+    },
 }
 
 

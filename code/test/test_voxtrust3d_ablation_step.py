@@ -17,7 +17,7 @@ if CODE_DIR not in sys.path:
 from networks.unet_2d import UNet2D
 from train.train_voxtrust3d_2d import VoxTrustSlice2DDataset
 from utils.voxtrust3d import RollingCalibrationBuffer, fit_distance_bins, stable_seed, strong_intensity_augment_2d
-from utils.voxtrust3d_ablation_step import voxtrust_step_knockout
+from utils.voxtrust3d_ablation_step import voxtrust_step_in_sample_class_only, voxtrust_step_knockout
 
 
 class FakeScribbleBench2DDataset:
@@ -160,6 +160,94 @@ class VoxtrustStepKnockoutTests(unittest.TestCase):
             augment_fn=strong_intensity_augment_2d, reliability_signal="top1_confidence",
         )
         self.assertNotAlmostEqual(diag_margin["reliability_mean"], diag_top1["reliability_mean"], places=6)
+
+
+class VoxtrustStepInSampleClassOnlyTests(unittest.TestCase):
+    def _fixture(self, holdout_fraction=0.15):
+        base = FakeScribbleBench2DDataset()
+        dataset = VoxTrustSlice2DDataset(base, [0, 1], holdout_fraction=holdout_fraction, seed=7, patch_size=(16, 16))
+        case_trees = {sid: dataset.case_trees(sid) for sid in dataset.slice_ids}
+        edges_np, d_max_np = fit_distance_bins(dataset.per_case_partitions(), base.num_classes, num_strata=3)
+        device = torch.device("cpu")
+        edges_t = torch.from_numpy(edges_np).float().to(device)
+        d_max_t = torch.from_numpy(d_max_np).float().to(device)
+        loader = DataLoader(dataset, batch_size=2, shuffle=False)
+        batch = next(iter(loader))
+
+        model = UNet2D(in_chns=1, class_num=base.num_classes, feature_chns=(4, 8, 16, 24, 32))
+        model_ema = UNet2D(in_chns=1, class_num=base.num_classes, feature_chns=(4, 8, 16, 24, 32))
+        model_ema.load_state_dict(model.state_dict())
+        for p in model_ema.parameters():
+            p.requires_grad_(False)
+
+        calibrator = RollingCalibrationBuffer(
+            num_classes=base.num_classes, num_strata=3, buffer_size=64, block_cap=8,
+            rng=np.random.default_rng(stable_seed(7, "calibrator")),
+        )
+        grid = np.linspace(0.0, 1.0, 21)
+        return dict(
+            model=model, model_ema=model_ema, batch=batch, device=device, ignore_index=base.ignore_index,
+            case_trees=case_trees, edges_t=edges_t, d_max_t=d_max_t, calibrator=calibrator, grid=grid,
+        )
+
+    def test_runs_and_backprops(self):
+        torch.manual_seed(0)
+        fixture = self._fixture()
+        loss_scrib, loss_pl, diagnostics = voxtrust_step_in_sample_class_only(
+            fixture["model"], fixture["model_ema"], fixture["batch"], fixture["device"], fixture["ignore_index"],
+            fixture["case_trees"], fixture["edges_t"], fixture["d_max_t"], fixture["calibrator"], fixture["grid"],
+            Args(), calibration_active=True, augment_fn=strong_intensity_augment_2d,
+        )
+        self.assertTrue(torch.isfinite(loss_scrib))
+        self.assertTrue(torch.isfinite(loss_pl))
+        self.assertIn("finite_class_only_thresholds", diagnostics)
+        loss = loss_scrib + loss_pl
+        loss.backward()
+        student_grad = sum(p.grad.abs().sum().item() for p in fixture["model"].parameters() if p.grad is not None)
+        self.assertGreater(student_grad, 0.0)
+
+    def test_calibration_inactive_skips_pseudo_label_branch(self):
+        torch.manual_seed(0)
+        fixture = self._fixture()
+        loss_scrib, loss_pl, diagnostics = voxtrust_step_in_sample_class_only(
+            fixture["model"], fixture["model_ema"], fixture["batch"], fixture["device"], fixture["ignore_index"],
+            fixture["case_trees"], fixture["edges_t"], fixture["d_max_t"], fixture["calibrator"], fixture["grid"],
+            Args(), calibration_active=False, augment_fn=strong_intensity_augment_2d,
+        )
+        self.assertEqual(loss_pl.item(), 0.0)
+        self.assertNotIn("reliability_mean", diagnostics)
+
+    def test_calibration_buffer_is_fed_from_omega_sup_not_omega_cal(self):
+        """The fixture's two slices each have exactly one scribble block per
+        class, so ``spatially_blocked_partition`` never holds anything out
+        at eta=0.15 (a class's last remaining block is never withheld):
+        Omega_cal is empty and Omega_sup holds every annotated pixel. Under
+        this fixture, the held-out arm (``voxtrust_step_knockout``, which
+        reads Omega_cal) must therefore end this call with an EMPTY
+        calibration buffer, while the in-sample arm (which reads Omega_sup)
+        must end it non-empty -- a direct, differential proof that the two
+        functions really do read from different evidence sources."""
+        torch.manual_seed(0)
+        held_out_fixture = self._fixture()
+        voxtrust_step_knockout(
+            held_out_fixture["model"], held_out_fixture["model_ema"], held_out_fixture["batch"],
+            held_out_fixture["device"], held_out_fixture["ignore_index"], held_out_fixture["case_trees"],
+            held_out_fixture["edges_t"], held_out_fixture["d_max_t"], held_out_fixture["calibrator"],
+            held_out_fixture["grid"], Args(), calibration_active=True, augment_fn=strong_intensity_augment_2d,
+        )
+        held_out_records = sum(len(buf) for buf in held_out_fixture["calibrator"].class_only.values())
+        self.assertEqual(held_out_records, 0)
+
+        torch.manual_seed(0)
+        in_sample_fixture = self._fixture()
+        voxtrust_step_in_sample_class_only(
+            in_sample_fixture["model"], in_sample_fixture["model_ema"], in_sample_fixture["batch"],
+            in_sample_fixture["device"], in_sample_fixture["ignore_index"], in_sample_fixture["case_trees"],
+            in_sample_fixture["edges_t"], in_sample_fixture["d_max_t"], in_sample_fixture["calibrator"],
+            in_sample_fixture["grid"], Args(), calibration_active=True, augment_fn=strong_intensity_augment_2d,
+        )
+        in_sample_records = sum(len(buf) for buf in in_sample_fixture["calibrator"].class_only.values())
+        self.assertGreater(in_sample_records, 0)
 
 
 if __name__ == "__main__":
